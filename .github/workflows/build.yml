@@ -12,16 +12,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install Tesseract (gets bundled into the exe)
-        run: choco install tesseract -y --no-progress
       - name: Build
         shell: pwsh
         run: |
           pip install -r requirements.txt
-          New-Item -ItemType Directory tess | Out-Null
-          Copy-Item "C:\Program Files\Tesseract-OCR\*" tess -Recurse
-          Get-ChildItem tess\tessdata -File | Where-Object { $_.Name -notin 'eng.traineddata','osd.traineddata' } | Remove-Item
-          pyinstaller --onefile --noconsole --name RippleReborn --icon logo.ico --add-data "logo.png;." --add-data "logo.ico;." --add-data "tess;tesseract" ripple_reborn.py
+          pyinstaller --onefile --noconsole --name RippleReborn --icon logo.ico --add-data "logo.png;." --add-data "logo.ico;." --collect-all winrt.runtime --collect-all winrt.windows.media.ocr --collect-all winrt.windows.graphics.imaging --collect-all winrt.windows.storage.streams --collect-all winrt.windows.foundation --collect-all winrt.windows.globalization ripple_reborn.py
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0-${{ github.run_number }}
