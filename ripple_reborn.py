@@ -1144,6 +1144,9 @@ class Bot:
     def find_team_rows(self):
         """Locate teammate rows (name boxes) in the squad list with OCR."""
         rows = []
+        start_rows = 0
+        self._slots = None
+        self._team_recheck = time.time()
         for inv in (False, True):
             for line in self.text_lines(self.scan_words("team", inv)):
                 words = [w for w in line if len(self.key(w["raw"])) >= 2]
@@ -1239,17 +1242,57 @@ class Bot:
     def update_team(self, rows):
         """Debounce: a new state counts after 3 readings in a row. Returns names now DEAD."""
         self.classify_rows(rows)
+        readable = any(r["now"] != "?" for r in rows)
         for r in rows:
             now = r["now"]
             if now == "?":
+                # a row that stays unreadable while the others read fine = player gone
+                if readable and r["state"] not in ("DEAD", "LEFT"):
+                    r.setdefault("unk_since", time.time())
+                    if time.time() - r["unk_since"] >= 45:
+                        r["state"] = "LEFT"
+                        self.log(f"Teammate {r['key']}: left the match (row empty for 45 s)")
                 continue
+            r.pop("unk_since", None)
             r["streak"] = {now: r["streak"].get(now, 0) + 1}
             if r["streak"][now] >= 3 and r["state"] != now:
                 old, r["state"] = r["state"], now
-                label = {"ALIVE": "is up" if old in ("KNOCKED", "DEAD") else "alive",
+                label = {"ALIVE": "is up" if old in ("KNOCKED", "DEAD", "LEFT") else "alive",
                          "KNOCKED": "knocked", "DEAD": "ELIMINATED"}[now]
                 self.log(f"Teammate {r['key']}: {label}")
-        return [r["key"] for r in rows if r["state"] == "DEAD"]
+        return [r["key"] for r in rows if r["state"] in ("DEAD", "LEFT")]
+
+    def recheck_team(self, rows, start_count):
+        """Re-read names: follow rows that moved up, and mark players gone from the list as LEFT.
+
+        A name only counts as gone when it is missing 3 checks in a row AND the bottom slot of
+        the squad list has really emptied (no bars), so an OCR miss can't make anyone 'leave'."""
+        found = self.find_team_rows()
+        if not found:
+            return
+        if not getattr(self, "_slots", None) or len(self._slots) < len(rows):
+            self._slots = [dict((k, r[k]) for k in ("x1", "x2", "y1", "y2", "h")) for r in
+                           sorted(rows, key=lambda r: r["y1"])]
+        bottom = dict(self._slots[-1], key="_slot", streak={}, state="?")
+        self.classify_rows([bottom])
+        shrunk = len(found) < start_count and bottom["now"] == "?"
+        keys = {f["key"]: f for f in found}
+        for r in rows:
+            f = keys.get(r["key"])
+            if f:
+                for k in ("x1", "x2", "y1", "y2", "h"):
+                    r[k] = f[k]                  # rows move up when someone leaves
+                r["miss"] = 0
+                if r["state"] == "LEFT":         # was a misread after all
+                    r["state"], r["streak"] = "?", {}
+            elif shrunk and r["state"] not in ("DEAD", "LEFT"):
+                r["miss"] = r.get("miss", 0) + 1
+                if r["miss"] >= 3:
+                    r["state"] = "LEFT"
+                    self.log(f"Teammate {r['key']}: left the match")
+            else:
+                r["miss"] = 0
+        rows.sort(key=lambda r: (r["state"] == "LEFT", r["y1"]))
 
     def read_team(self):
         """Teammate names from the squad list in the bottom-left corner."""
@@ -1521,11 +1564,18 @@ class Bot:
                     found = self.find_team_rows()
                     if len(found) > len(rows):
                         rows = found
+                        start_rows = len(rows)
                         self.log(f"Squad list: {', '.join(r['key'] for r in rows)}")
                 if len(rows) >= 2:              # never decide from a half-read squad list
-                    dead = self.update_team(rows)
+                    if time.time() - getattr(self, "_team_recheck", 0) > 15:
+                        self._team_recheck = time.time()
+                        self.recheck_team(rows, start_rows)
+                    live = [r for r in rows if r["state"] != "LEFT"]
+                    if live:
+                        self.update_team(live)
+                    dead = [r["key"] for r in rows if r["state"] in ("DEAD", "LEFT")]
                     if len(dead) >= 2:
-                        self.log(f"2 teammates eliminated ({', '.join(dead)}) - leaving.")
+                        self.log(f"2 teammates out ({', '.join(dead)}) - leaving.")
                         break
 
             if time.time() - last_banner > 4:
