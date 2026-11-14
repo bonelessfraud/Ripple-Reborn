@@ -388,6 +388,29 @@ def find_fortnite():
     return found[0] if found else None
 
 
+def own_window_rects():
+    """Screen rectangles of this program's visible windows."""
+    if not IS_WIN:
+        return []
+    pid = os.getpid()
+    rects = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            p = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value == pid:
+                r = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(r))
+                if r.right - r.left > 20 and r.bottom - r.top > 20:
+                    rects.append((r.left, r.top, r.right, r.bottom))
+        return True
+
+    user32.EnumWindows(cb, 0)
+    return rects
+
+
 def client_rect(hwnd):
     """Screen-space (x, y, w, h) of the window's client area."""
     rc = wintypes.RECT()
@@ -724,10 +747,14 @@ class Bot:
         fx1, fy1, fx2, fy2 = region or (0.0, 0.0, 1.0, 1.0)
         box = (int(x + fx1 * w), int(y + fy1 * h), int(x + fx2 * w), int(y + fy2 * h))
         img = grab(box)
+        mine = own_window_rects()
         out = []
         for t, wx, wy, ww, wh in ocr_words(img, inv):
-            out.append(dict(t=norm_word(t), raw=t, cx=box[0] + wx + ww / 2, cy=box[1] + wy + wh / 2,
-                            h=wh, fy=(box[1] + wy + wh / 2 - y) / h))
+            cx, cy = box[0] + wx + ww / 2, box[1] + wy + wh / 2
+            if any(l <= cx <= r and tp <= cy <= b for l, tp, r, b in mine):
+                continue  # text from the bot's own window, not Fortnite
+            out.append(dict(t=norm_word(t), raw=t, cx=cx, cy=cy, h=wh,
+                            fx=(cx - x) / w, fy=(cy - y) / h))
         return out
 
     def find_text(self, targets, region=None, pick="largest", min_fy=0.0):
@@ -739,7 +766,10 @@ class Bot:
             seen = seen or ws
             hits = [w for w in ws if w["t"] in targets and w["fy"] >= min_fy]
             if hits:
-                hits.sort(key=(lambda w: -w["h"]) if pick == "largest" else (lambda w: w["fy"]))
+                if pick == "largest":
+                    hits.sort(key=lambda w: (w["fx"] > 0.6, -w["h"]))
+                else:
+                    hits.sort(key=lambda w: w["fy"])
                 return hits[0], ws
         return None, seen
 
@@ -786,13 +816,15 @@ class Bot:
 
     def diagnose(self):
         """Used by Test OCR: report what the bot can actually see."""
-        self.rect()
+        x, y, w, h = self.rect()
+        self.log(f"Fortnite game area: {w}x{h} at ({x}, {y}).")
+        if any(r[0] < x + w and r[2] > x and r[1] < y + h and r[3] > y for r in own_window_rects()):
+            self.log("Note: a bot window overlaps Fortnite - press Position window first.")
         lobby = self.in_lobby()
         ws = self.scan_words()
         self.log(f"Lobby detected: {lobby}.  Words on screen: {self.words_summary(ws)}")
         hit, _ = self.find_text(["PLAY"], min_fy=0.12)
         if hit:
-            x, y, w, h = self.rect()
             self.log(f"PLAY button found at ({int(hit['cx'] - x)}, {int(hit['cy'] - y)}) in the game "
                      f"= {(hit['cx'] - x) / w:.3f}, {(hit['cy'] - y) / h:.3f}")
         else:
@@ -866,7 +898,13 @@ class Bot:
             self.log("Started.")
             if not ocr_ready():
                 self.log("WARNING: no OCR engine available - OCR features will not work.")
-            self.rect()
+            x, y, w, h = self.rect()
+            if (w, h) != (TARGET_W, TARGET_H) or x > 20 or y > 60:
+                x, y, w, h = position_fortnite(self.hwnd)
+                self.log(f"Moved Fortnite to the top left ({w}x{h}).")
+            covered = [r for r in own_window_rects() if r[0] < x + w and r[2] > x and r[1] < y + h and r[3] > y]
+            if covered:
+                self.log("Note: a bot window overlaps Fortnite - the bot cannot see under it.")
             while True:
                 self.cycle()
         except Stopped:
@@ -944,7 +982,7 @@ class Bot:
             self.sleep(4)
             in_lobby = self.in_lobby()
             ws = self.scan_words()
-            queued = {w["t"] for w in ws} & {"CANCEL", "MATCHMAKING", "SEARCHING", "LOADING", "QUEUE"}
+            queued = {w["t"] for w in ws} & {"CANCEL", "SEARCHING", "LOADING", "QUEUE"}
             if in_lobby is False or queued:
                 return True
             self.log(f"PLAY click {attempt}: still in the lobby. Saw: {self.words_summary(ws)}")
@@ -1616,10 +1654,21 @@ class App:
             self.headline.config(text="Stopped")
 
     # --- actions ----------------------------------------------------------
+    def place_beside(self):
+        """Put the bot window right of the 1280x720 Fortnite window."""
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        ww = self.root.winfo_width()
+        wx = TARGET_W + 20 if TARGET_W + 20 + ww <= sw else max(0, sw - ww)
+        self.root.geometry(f"+{wx}+10")
+
     def toggle_start(self):
         if self.bot.running:
             self.bot.stop()
         else:
+            if self.settings_win and self.settings_win.winfo_exists():
+                self.settings_win.destroy()  # don't let it cover the game
+            self.place_beside()
             self.bot.start()
 
     def open_settings(self):
@@ -1643,6 +1692,7 @@ class App:
                 return
             hwnd = find_fortnite()
             x, y, w, h = position_fortnite(hwnd)
+            self.call(self.place_beside)
             self.log("Fortnite moved to the top left." if (w, h) == (TARGET_W, TARGET_H)
                      else f"Fortnite client is {w}x{h} (wanted {TARGET_W}x{TARGET_H}). "
                           "Set the in-game resolution to 1280x720 windowed.")
@@ -1654,8 +1704,20 @@ class App:
                 self.log("No OCR engine available.")
                 return
             self.log(f"OCR engine: {'Windows' if _load_winocr() else 'Tesseract'}")
-            self.bot.diagnose()
+            try:
+                self.bot.diagnose()
+            finally:
+                self.call(self._show_settings)
+        sw = self.settings_win
+        if sw and sw.winfo_exists():
+            sw.withdraw()
+            self.root.update()
+            time.sleep(0.3)
         self.run_bg(go)
+
+    def _show_settings(self):
+        if self.settings_win and self.settings_win.winfo_exists():
+            self.settings_win.deiconify()
 
     def test_leave(self):
         def go():
