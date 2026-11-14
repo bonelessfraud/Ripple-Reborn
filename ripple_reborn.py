@@ -70,14 +70,15 @@ ZONES = {
     "lobby": (0.000, 0.000, 1.000, 0.120),     # top menu bar (PLAY SHOP LOCKER ...)
     "results": (0.300, 0.050, 0.700, 0.200),   # results / victory header
     "banner": (0.380, 0.080, 0.620, 0.320),    # "YOU FOUND ... GIZMO" banner
-    "feed": (0.010, 0.350, 0.300, 0.600),      # elimination / reboot feed
+    "feed": (0.010, 0.420, 0.320, 0.650),      # elimination / reboot feed
+    "team": (0.000, 0.700, 0.160, 0.860),      # teammate names + health bars (bottom left)
 }
-POINTS_VERSION = "5"
+POINTS_VERSION = "6"
 # Fortnite pins HUD pieces to the top, bottom or middle of the screen. Positions are stored
 # for a 16:9 picture and mapped onto taller screens (16:10) from that anchor.
 ANCHOR = {"play": "bottom", "mode": "bottom", "menu_tab": "top", "leave_menu": "top",
           "leave_confirm": "center", "play_again": "bottom", "claim": "bottom", "players": "top", "lobby": "top",
-          "results": "top", "banner": "top", "feed": "bottom"}
+          "results": "top", "banner": "top", "feed": "bottom", "team": "bottom"}
 
 
 def anchor_of(name):
@@ -1076,6 +1077,55 @@ class Bot:
         self.sleep(2.5)
         return True
 
+    @staticmethod
+    def text_lines(ws):
+        """Group OCR words into lines, left to right."""
+        lines = []
+        for w in sorted(ws, key=lambda w: w["cy"]):
+            if lines and abs(lines[-1][-1]["cy"] - w["cy"]) < max(6, w["h"] * 0.6):
+                lines[-1].append(w)
+            else:
+                lines.append([w])
+        return [sorted(l, key=lambda w: w["cx"]) for l in lines]
+
+    @staticmethod
+    def key(text):
+        return re.sub(r"[^a-z0-9]", "", text.lower())
+
+    def read_team(self):
+        """Teammate names from the squad list in the bottom-left corner."""
+        names = []
+        for inv in (False, True):
+            for line in self.text_lines(self.scan_words("team", inv)):
+                # the name is the longest word on the row (icons read as 1-2 junk characters)
+                k = max((self.key(w["raw"]) for w in line), key=len, default="")
+                if len(k) >= 5 and any(c.isalpha() for c in k) and k[:6] not in names:
+                    names.append(k[:6])
+            if names:
+                break
+        return names[:3]
+
+    def check_team_out(self, team, out):
+        """Add teammates the kill feed shows as eliminated (not knocked) to `out`."""
+        for line in self.text_lines(self.scan_words("feed")):
+            words = [self.key(w["raw"]) for w in line]
+            words = [w for w in words if w]
+            if len(words) < 2:
+                continue
+            full = "".join(words)
+            if any(k in full for k in ("knocked", "revived", "rebooted", "reboot")):
+                continue
+            first, rest = words[0], "".join(words[1:])
+            for name in team:
+                if name in out:
+                    continue
+                victim = name in rest and not first.startswith(name[:4])
+                self_kill = first.startswith(name[:4]) and \
+                    any(k in full for k in ("storm", "fell", "died", "death"))
+                if victim or self_kill:
+                    out.add(name)
+                    self.log(f"Teammate out: {' '.join(w['raw'] for w in line)}")
+
     def yellow_buttons(self):
         """Yellow buttons in the game (absolute screen boxes), ignoring the bot's own windows."""
         x, y, w, h = self.rect()
@@ -1237,7 +1287,7 @@ class Bot:
             mouse_move_rel(0, -up)
         match_start = time.time()
         sent_first = sent_second = False
-        team_out = 0
+        team, team_out = [], set()
         last_banner = 0.0
 
         # ---- in match ----
@@ -1293,15 +1343,19 @@ class Bot:
                     self.chat(self.s.get("text", "thanks"))
                     self.sleep(8)
                 if self.s.bool("main", "leave_if_team_out"):
-                    words = self.s.get("text", "team_out_words").split(",")
-                    hits = sum(feed.count(w.strip()) for w in words if w.strip())
-                    if hits:
-                        team_out += hits
-                        self.log(f"Team elimination seen ({team_out}/2).")
-                        self.sleep(10)  # same feed line will still be visible
-                    if team_out >= 2:
-                        self.log("Team is out - leaving.")
-                        break
+                    if not team:
+                        team = self.read_team()
+                        if team:
+                            self.log(f"Teammates: {', '.join(team)}")
+                    if team:
+                        before = len(team_out)
+                        self.check_team_out(team, team_out)
+                        need = min(2, len(team))
+                        if len(team_out) != before:
+                            self.log(f"Teammates eliminated: {len(team_out)}/{need}")
+                        if len(team_out) >= need:
+                            self.log("Team is out - leaving.")
+                            break
 
             if self.s.bool("main", "movement"):
                 self.move_once()
@@ -1317,20 +1371,52 @@ class Bot:
     # --- discord ----------------------------------------------------------
     def discord(self, text, with_shot=False):
         url = self.s.get("discord", "webhook").strip()
-        if not valid_webhook(url) or requests is None:
+        if not valid_webhook(url):
+            self.log("Discord: the webhook URL is missing or not valid.")
             return False
-        try:
-            files = None
-            if with_shot:
+        png = None
+        if with_shot:
+            try:
                 buf = io.BytesIO()
                 self.full_shot().save(buf, "PNG")
-                buf.seek(0)
-                files = {"file": ("shot.png", buf, "image/png")}
-            r = requests.post(url, data={"content": text}, files=files, timeout=15)
-            return r.status_code < 300
-        except Exception as e:
-            self.log(f"Discord error: {e}")
-            return False
+                png = buf.getvalue()
+            except Exception:
+                png = None
+        err = "requests not available"
+        if requests is not None:
+            try:
+                files = {"file": ("shot.png", png, "image/png")} if png else None
+                r = requests.post(url, data={"content": text}, files=files, timeout=15)
+                if r.status_code < 300:
+                    return True
+                err = f"HTTP {r.status_code}: {r.text[:120]}"
+            except Exception as e:
+                err = str(e)
+        # Firewalls / antivirus often block a new unsigned .exe from the internet
+        # ("Permission denied"). Windows' own curl.exe is normally allowed, so retry with it.
+        if IS_WIN:
+            try:
+                args = ["curl.exe", "-s", "-o", "NUL", "-w", "%{http_code}", "--max-time", "20",
+                        "--form-string", f"content={text}"]
+                if png:
+                    path = os.path.join(DEBUG_DIR, "discord_shot.png")
+                    with open(path, "wb") as f:
+                        f.write(png)
+                    args += ["-F", f"file=@{path};type=image/png"]
+                args.append(url)
+                r = subprocess.run(args, capture_output=True, text=True, timeout=30,
+                                   creationflags=0x08000000)  # no console window
+                code = (r.stdout or "").strip()
+                if code.startswith("2"):
+                    return True
+                err += f" | curl: {code or r.stderr.strip()[:120]}"
+            except Exception as e:
+                err += f" | curl: {e}"
+        self.log(f"Discord error: {err}")
+        if "Permission denied" in err or "10013" in err:
+            self.log("Windows is blocking RippleReborn from the internet: allow it in Windows "
+                     "Firewall / your antivirus.")
+        return False
 
 
 WEBHOOK_RE = re.compile(r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+/?$")
@@ -1929,7 +2015,7 @@ class App:
     def test_discord(self):
         def go():
             ok = self.bot.discord("Ripple Reborn: webhook test", with_shot=False)
-            self.log("Discord test sent." if ok else "Discord test failed (check the URL).")
+            self.log("Discord test sent." if ok else "Discord test failed - see the error above.")
         self.run_bg(go)
 
     def screenshot(self):
