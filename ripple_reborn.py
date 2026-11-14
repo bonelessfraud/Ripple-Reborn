@@ -57,25 +57,27 @@ os.makedirs(DEBUG_DIR, exist_ok=True)
 # them in Settings > Tools (Calibrate) if a click lands in the wrong spot.
 # ----------------------------------------------------------------------------
 POINTS = {
-    "play": (0.100, 0.668),          # lobby PLAY button (fallback if OCR cannot find it)
-    "mode": (0.288, 0.668),          # the "..." next to PLAY (opens the mode list)
-    "leave_menu": (0.500, 0.640),    # "Leave match" in the Esc menu
-    "leave_confirm": (0.420, 0.600), # confirm-leave button
+    "play": (0.135, 0.844),          # lobby PLAY (fallback; the bot looks for the yellow button)
+    "mode": (0.135, 0.665),          # lobby "Zero Build, Squad, Fill" button (opens mode panel)
+    "menu_tab": (0.873, 0.065),      # the "≡" tab in the in-match Esc panel
+    "leave_menu": (0.809, 0.160),    # "Return to lobby" in that tab
+    "leave_confirm": (0.500, 0.600), # confirm button, if Fortnite asks
     "play_again": (0.880, 0.940),    # play again on the results screen
+    "claim": (0.580, 0.912),         # CLAIM / CLAIM ALL on reward screens (fallback)
 }
 ZONES = {
     "players": (0.905, 0.030, 0.985, 0.075),   # players-left counter
     "lobby": (0.000, 0.000, 1.000, 0.120),     # top menu bar (PLAY SHOP LOCKER ...)
     "results": (0.300, 0.050, 0.700, 0.200),   # results / victory header
-    "banner": (0.250, 0.200, 0.750, 0.330),    # item-found banner
+    "banner": (0.380, 0.080, 0.620, 0.320),    # "YOU FOUND ... GIZMO" banner
     "feed": (0.010, 0.350, 0.300, 0.600),      # elimination / reboot feed
 }
-POINTS_VERSION = "4"
+POINTS_VERSION = "5"
 # Fortnite pins HUD pieces to the top, bottom or middle of the screen. Positions are stored
 # for a 16:9 picture and mapped onto taller screens (16:10) from that anchor.
-ANCHOR = {"play": "bottom", "mode": "bottom", "quads": "center", "leave_menu": "center",
-          "leave_confirm": "center", "play_again": "bottom", "players": "top", "lobby": "top",
-          "results": "top", "banner": "center", "feed": "bottom"}
+ANCHOR = {"play": "bottom", "mode": "bottom", "menu_tab": "top", "leave_menu": "top",
+          "leave_confirm": "center", "play_again": "bottom", "claim": "bottom", "players": "top", "lobby": "top",
+          "results": "top", "banner": "top", "feed": "bottom"}
 
 
 def anchor_of(name):
@@ -920,19 +922,33 @@ class Bot:
         self.log(f"Chat: {text}")
 
     def leave_match(self):
+        """Esc opens the side panel; the ≡ tab has 'Return to lobby'."""
         self.status("Leaving match", "")
         self.log("Leaving the match.")
         focus(self.hwnd)
         tap("esc")
-        self.sleep(1.2)
-        self.click_text(["LEAVE"], "Leave match", fallback="leave_menu", pick="first")
         self.sleep(1.5)
-        hit, _ = self.find_text(["LEAVE", "CONFIRM", "YES"], pick="first")
-        if hit:
-            self.log("Confirming leave.")
-            self.click_abs(hit["cx"], hit["cy"])
-        elif not self.in_lobby():
-            self.click_point("leave_confirm")
+        clicked = False
+        for attempt in range(3):
+            hit, _ = self.find_text(["RETURN", "LEAVE"], pick="first")
+            if hit:
+                self.log(f"Clicking Return to lobby at ({int(hit['cx'])}, {int(hit['cy'])}).")
+                self.click_abs(hit["cx"], hit["cy"])
+                clicked = True
+                break
+            self.log("Opening the ≡ menu tab.")
+            self.click_point("menu_tab")
+            self.sleep(1.2)
+        if not clicked:
+            self.log("Return to lobby not found by OCR - clicking its usual spot.")
+            self.click_point("leave_menu")
+        self.sleep(2.0)
+        # a confirm box, if Fortnite shows one
+        if not self.in_lobby():
+            hit, _ = self.find_text(["CONFIRM", "YES", "RETURN", "LEAVE"], pick="first")
+            if hit:
+                self.log("Confirming.")
+                self.click_abs(hit["cx"], hit["cy"])
 
     def move_once(self):
         pick, gun = self.s.get("options", "pickaxe_key"), self.s.get("options", "gun_key")
@@ -1014,6 +1030,8 @@ class Bot:
                     self.log("Results screen - Play again.")
                     self.click_abs(hit["cx"], hit["cy"])
                     self.sleep(3)
+            if self.claim_rewards():
+                continue
             lobby = self.in_lobby()
             if lobby is None:  # OCR detection disabled: just give the game time
                 self.sleep(self.s.int("match", "lobby_settle"))
@@ -1025,6 +1043,39 @@ class Bot:
                 t0 = time.time()
             self.sleep(2)
 
+    def claim_rewards(self, ws=None):
+        """Reward screens ('PIRATE SHOP ACCESS UNLOCKED!' / 'ITEM ACQUIRED'): press CLAIM."""
+        ws = self.scan_words() if ws is None else ws
+        claims = [w for w in ws if w["t"] == "CLAIM"]
+        if not claims:
+            ws2 = self.scan_words(inv=True)
+            claims = [w for w in ws2 if w["t"] == "CLAIM"]
+            ws = ws2 if claims else ws
+        t = {w["t"] for w in ws}
+        if not claims:
+            if not t & {"ACQUIRED", "UNLOCKED"}:
+                return False
+            # reward screen, but the pale button text was not readable: use its usual spot
+            px, py = self.abs_point("claim")
+            claims = [dict(t="CLAIM", raw="CLAIM", cx=px, cy=py, h=20, fx=0.58, fy=0.91)]
+        # the button is the lowest CLAIM on screen (the description text also says "claim")
+        btn = max(claims, key=lambda w: w["cy"])
+        if time.time() - getattr(self, "_last_claim", 0) > 10:
+            if t & {"PIRATE", "ACCESS"}:
+                what = "Pirate Shop Access"
+            else:
+                big = sorted((w for w in ws if w["h"] > btn["h"] * 1.4 and w["t"] not in ("ITEM", "ACQUIRED")),
+                             key=lambda w: (round(w["cy"] / 20), w["cx"]))
+                what = " ".join(w["raw"] for w in big[:5]) or "an item"
+            self.stats["found"] += 1
+            self.push_stats()
+            self.log(f"Reward screen: {what} - claiming.")
+            self.discord(f"Claimed: {what}", self.s.bool("discord", "shot_on_find"))
+        self._last_claim = time.time()
+        self.click_abs(btn["cx"], btn["cy"])
+        self.sleep(2.5)
+        return True
+
     def yellow_buttons(self):
         """Yellow buttons in the game (absolute screen boxes), ignoring the bot's own windows."""
         x, y, w, h = self.rect()
@@ -1034,6 +1085,8 @@ class Bot:
         for bx1, by1, bx2, by2 in find_yellow_buttons(img):
             b = (x + bx1, y + by1, x + bx2, y + by2)
             cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            if cy - y < 0.6 * h:
+                continue  # gold treasure in the lobby background, not a button
             if not any(l <= cx <= r and t <= cy <= bt for l, t, r, bt in mine):
                 out.append(b)
         return out
@@ -1048,8 +1101,14 @@ class Bot:
         """Team Size row: the 4th (right-most) icon is Squad. Located from the PLAY button."""
         x1, y1, x2, y2 = play_box
         u = (x2 - x1) / 232.0                  # PLAY button is 232 px wide at 1280x720
-        ix, iy = x1 + 373 * u, (y1 + y2) / 2 - 387 * u
-        row = {w["t"] for w in ws if abs(w["cy"] - iy) < 45 * u and w["cx"] < ix}
+        _, _, w, h = self.rect()
+        ix = x1 + 373 * u
+        size = [s_ for s_ in ws if s_["t"] == "SIZE" and s_["cx"] < ix]
+        if size:
+            iy = size[0]["cy"] + 8 * u
+        else:                                  # taller screens (16:10) add space above PLAY
+            iy = (y1 + y2) / 2 - 387 * u - (h - min(h, w * 9 / 16))
+        row = {w_["t"] for w_ in ws if abs(w_["cy"] - iy) < 45 * u and w_["cx"] < ix}
         if row & {"SQUAD", "SQUADS"}:
             self.log("Team size is already Squad.")
             return
@@ -1075,19 +1134,29 @@ class Bot:
         return not self.yellow_buttons() and not self.panel_open(ws)[0]
 
     def open_mode_panel(self):
-        """Click the mode name in the lobby (e.g. 'BATTLE ROYALE - ZERO BUILD') to open the panel."""
-        hit, _ = self.find_text(["ROYALE", "BATTLE"], pick="first")
-        if hit and hit["fy"] < 0.35:
-            self.log("Opening the mode panel.")
-            self.click_abs(hit["cx"], hit["cy"])
-            self.sleep(2.0)
-            opened, _ = self.panel_open()
-            if opened:
-                return True
+        """Click the lobby mode button ('Zero Build, Squad, Fill') above PLAY."""
+        hit, _ = self.find_text(["SQUAD", "SQUADS", "FILL", "BUILD", "SOLO", "DUO", "DUOS", "TRIO", "TRIOS"],
+                                pick="first", min_fy=0.45)
+        if hit and hit["fx"] < 0.35:
+            x, y = hit["cx"], hit["cy"]
+        else:
+            boxes = self.yellow_buttons()
+            if boxes:                              # 193 px above PLAY when PLAY is 328 px wide
+                b = boxes[0]
+                u = (b[2] - b[0]) / 328.0
+                x, y = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2 - 193 * u
+            else:
+                x, y = self.abs_point("mode")
+        self.log(f"Opening the mode panel at ({int(x)}, {int(y)}).")
+        self.click_abs(x, y)
+        self.sleep(2.0)
+        opened, _ = self.panel_open()
+        if not opened:
+            self.log("Mode panel did not open.")
             if not self.in_lobby():
-                tap("esc")       # something else opened - go back
+                tap("esc")
                 self.sleep(1.0)
-        return False
+        return opened
 
     def queue_game(self):
         """Get from the lobby into matchmaking, setting Squad on the way if asked."""
@@ -1123,6 +1192,8 @@ class Bot:
         self.wait_lobby()
         self.status("In lobby", "Settling...")
         self.sleep(self.s.int("match", "lobby_settle"))
+        while self.claim_rewards():
+            pass
         self.queue_game()
         self.stats["matches"] += 1
         self.push_stats()
@@ -1193,13 +1264,28 @@ class Bot:
 
             if time.time() - last_banner > 4:
                 last_banner = time.time()
-                if self.has_words("banner", self.s.get("text", "banner_words")):
+                keys = [k.strip().upper() for k in self.s.get("text", "banner_words").split(",") if k.strip()]
+
+                def is_find(words):
+                    return any(k in t_ for k in keys for t_ in words) or \
+                        any(t_.startswith("FOUN") or "GIZM" in t_ for t_ in words)
+
+                bt = []
+                for inv in (False, True):
+                    bt = [w["t"] for w in self.scan_words("banner", inv)]
+                    if is_find(bt):
+                        break
+                if is_find(bt):
+                    after = bt[bt.index("FOUND") + 1:] if "FOUND" in bt else []
+                    name = " ".join(t_ for t_ in after if len(t_) > 2).title() or "Gizmo"
                     self.stats["gizmos"] += 1
-                    self.stats["found"] += 1
                     self.push_stats()
-                    self.log("Item banner detected.")
-                    self.discord("Item found!", self.s.bool("discord", "shot_on_find"))
+                    self.log(f"Found: {name}")
+                    self.discord(f"Found {name}!", self.s.bool("discord", "shot_on_find"))
                     self.sleep(6)
+                if time.time() - getattr(self, "_last_claim_scan", 0) > 12:
+                    self._last_claim_scan = time.time()
+                    self.claim_rewards()
                 feed = ocr_text(self.zone_img("feed")).lower()
                 if self.s.bool("main", "reboot_thanks") and \
                         any(w.strip() and w.strip() in feed
