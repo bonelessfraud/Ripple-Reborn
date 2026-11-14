@@ -100,6 +100,14 @@ for _z, _r in ZONES.items():
     DEFAULTS["points"][f"{_z}_tl"] = f"{_r[0]:.4f},{_r[1]:.4f}"
     DEFAULTS["points"][f"{_z}_br"] = f"{_r[2]:.4f},{_r[3]:.4f}"
 
+SCALE = 1.0
+
+
+def S(n):
+    """Scale a pixel size for high-DPI displays."""
+    return max(1, int(round(n * SCALE)))
+
+
 def resource(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
@@ -402,22 +410,91 @@ def setup_tesseract():
         return False
 
 
-def prep(img, invert=False):
+_WINOCR = None      # None = not tried yet, False = unavailable, tuple = ready
+_tls = threading.local()
+OCR_ERROR = ""
+
+
+def _load_winocr():
+    """Windows 10/11 ships an OCR engine; use it so no extra program is needed."""
+    global _WINOCR
+    if _WINOCR is None:
+        try:
+            from winrt.windows.media.ocr import OcrEngine
+            from winrt.windows.graphics.imaging import BitmapDecoder
+            from winrt.windows.storage.streams import InMemoryRandomAccessStream, DataWriter
+            _WINOCR = (OcrEngine, BitmapDecoder, InMemoryRandomAccessStream, DataWriter)
+        except Exception:
+            _WINOCR = False
+    return _WINOCR
+
+
+def ocr_ready():
+    return bool(_load_winocr()) or setup_tesseract()
+
+
+async def _winocr_async(png):
+    OcrEngine, BitmapDecoder, Stream, Writer = _WINOCR
+    stream = Stream()
+    w = Writer(stream)
+    w.write_bytes(png)
+    await w.store_async()
+    w.detach_stream()
+    stream.seek(0)
+    dec = await BitmapDecoder.create_async(stream)
+    bmp = await dec.get_software_bitmap_async()
+    eng = OcrEngine.try_create_from_user_profile_languages()
+    res = await eng.recognize_async(bmp)
+    return res.text
+
+
+def _winocr(img):
+    global OCR_ERROR
+    import asyncio
+    if not getattr(_tls, "init", False):
+        _tls.init = True
+        try:
+            from winrt.runtime import init_apartment
+            init_apartment()
+        except Exception:
+            pass
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    try:
+        return asyncio.run(_winocr_async(buf.getvalue())).strip()
+    except Exception as e:
+        OCR_ERROR = str(e)
+        return ""
+
+
+def prep(img, invert=False, binarize=True):
     g = ImageOps.grayscale(img)
     g = g.resize((g.width * 3, g.height * 3), Image.LANCZOS)
     g = ImageOps.autocontrast(g)
     if invert:
         g = ImageOps.invert(g)
+    if not binarize:
+        # Windows OCR likes a little white border and plain grey text
+        return ImageOps.expand(g, border=12, fill=255 if invert else 0)
     return g.point(lambda v: 255 if v > 150 else 0)
+
+
+def _read(img, inv, numeric):
+    if _load_winocr():
+        return _winocr(prep(img, inv, binarize=False))
+    if pytesseract is None:
+        return ""
+    try:
+        cfg = "--psm 7 -c tessedit_char_whitelist=0123456789" if numeric else "--psm 6"
+        return pytesseract.image_to_string(prep(img, inv), config=cfg).strip()
+    except Exception:
+        return ""
 
 
 def ocr_text(img):
     best = ""
     for inv in (False, True):
-        try:
-            t = pytesseract.image_to_string(prep(img, inv), config="--psm 6").strip()
-        except Exception:
-            t = ""
+        t = _read(img, inv, False)
         if len(t) > len(best):
             best = t
     return best
@@ -425,12 +502,7 @@ def ocr_text(img):
 
 def ocr_number(img):
     for inv in (False, True):
-        try:
-            t = pytesseract.image_to_string(
-                prep(img, inv), config="--psm 7 -c tessedit_char_whitelist=0123456789").strip()
-        except Exception:
-            t = ""
-        m = re.search(r"\d{1,3}", t)
+        m = re.search(r"\d{1,3}", _read(img, inv, True))
         if m:
             return int(m.group())
     return None
@@ -628,8 +700,8 @@ class Bot:
     def _run(self):
         try:
             self.log("Started.")
-            if not setup_tesseract():
-                self.log("WARNING: Tesseract not found - OCR features will not work.")
+            if not ocr_ready():
+                self.log("WARNING: no OCR engine available - OCR features will not work.")
             self.rect()
             while True:
                 self.cycle()
@@ -831,7 +903,10 @@ class RoundBtn(tk.Canvas):
     def __init__(self, parent, text, command, bg=OFF, fg=FG, font=FONT, w=None, h=32, r=12):
         if w is None:
             import tkinter.font as tkfont
-            w = tkfont.Font(font=font).measure(text) + 30
+            w = tkfont.Font(font=font).measure(text) + S(30)
+        else:
+            w = S(w)
+        h, r = S(h), S(r)
         super().__init__(parent, width=w, height=h, bg=BG, highlightthickness=0, bd=0,
                          cursor="hand2")
         self._rb = dict(text=text, fg=fg, bg=bg, font=font, r=r, hover=False, cmd=command)
@@ -872,7 +947,7 @@ class RoundBtn(tk.Canvas):
 
 class Toggle(tk.Canvas):
     def __init__(self, parent, var, command=None):
-        super().__init__(parent, width=54, height=24, bg=BG, highlightthickness=0, bd=0,
+        super().__init__(parent, width=S(54), height=S(24), bg=BG, highlightthickness=0, bd=0,
                          cursor="hand2")
         self.var, self.command = var, command
         self.bind("<Button-1>", self._flip)
@@ -887,8 +962,8 @@ class Toggle(tk.Canvas):
     def _paint(self):
         on = self.var.get()
         self.delete("all")
-        round_rect(self, 1, 1, 53, 23, 12, fill=ACCENT if on else OFF, outline="")
-        self.create_text(27, 12, text="On" if on else "Off", fill=FG if on else DIM,
+        round_rect(self, 1, 1, S(54) - 1, S(24) - 1, S(12), fill=ACCENT if on else OFF, outline="")
+        self.create_text(S(54) // 2, S(24) // 2, text="On" if on else "Off", fill=FG if on else DIM,
                          font=("Segoe UI", 9, "bold"))
 
 
@@ -896,7 +971,7 @@ class Check(tk.Frame):
     def __init__(self, parent, text, var):
         super().__init__(parent, bg=BG)
         self.var = var
-        self.box = tk.Canvas(self, width=20, height=20, bg=BG, highlightthickness=0, bd=0,
+        self.box = tk.Canvas(self, width=S(20), height=S(20), bg=BG, highlightthickness=0, bd=0,
                              cursor="hand2")
         self.box.pack(side="left")
         self.lbl = tk.Label(self, text=text, bg=BG, fg=FG, font=FONT, cursor="hand2")
@@ -909,9 +984,9 @@ class Check(tk.Frame):
     def _paint(self):
         on = self.var.get()
         self.box.delete("all")
-        round_rect(self.box, 1, 1, 19, 19, 6, fill=PINK if on else OFF, outline="")
+        round_rect(self.box, 1, 1, S(20) - 1, S(20) - 1, S(6), fill=PINK if on else OFF, outline="")
         if on:
-            self.box.create_text(10, 10, text="✓", fill="white", font=("Segoe UI", 10, "bold"))
+            self.box.create_text(S(20) // 2, S(20) // 2, text="✓", fill="white", font=("Segoe UI", 10, "bold"))
 
 
 def flat_button(parent, text, cmd, bg=OFF, fg=FG, w=None, h=32, font=FONT):
@@ -952,7 +1027,6 @@ class SettingsWindow(tk.Toplevel):
         self.title(f"Settings — Ripple Reborn v{VERSION}")
         self.configure(bg=BG)
         set_icon(self)
-        self.geometry("720x360")
         self.attributes("-topmost", self.s.bool("options", "always_on_top"))
         # footer first so it never gets squeezed out
         foot = tk.Frame(self, bg=BG)
@@ -981,7 +1055,14 @@ class SettingsWindow(tk.Toplevel):
         self.build_options()
         self.build_discord()
         self.build_tools()
+        self.update_idletasks()
+        mw = mh = 0
+        for n in self.tabs:               # size the window to the biggest tab
+            self.select(n)
+            self.update_idletasks()
+            mw, mh = max(mw, self.winfo_reqwidth()), max(mh, self.winfo_reqheight())
         self.select("Match")
+        self.geometry(f"{max(mw, S(700))}x{mh}")
         dark_titlebar(self)
 
     def select(self, name):
@@ -1023,7 +1104,7 @@ class SettingsWindow(tk.Toplevel):
         self.spin(f, "Lobby settle wait (seconds)", "match", "lobby_settle", 0, 120, 3, 1)
         tk.Label(f, text="Lobby settle wait: pause after returning to the lobby, before clicking "
                  "anything. Raise it if the bot clicks too fast for Fortnite to catch up.",
-                 bg=BG, fg=DIM, font=FONT_S, wraplength=640, justify="left", anchor="w").grid(
+                 bg=BG, fg=DIM, font=FONT_S, wraplength=S(640), justify="left", anchor="w").grid(
             row=4, column=0, columnspan=4, sticky="w", padx=10, pady=14)
 
     def build_options(self):
@@ -1118,7 +1199,7 @@ class SettingsWindow(tk.Toplevel):
                  "4 test OCR · 5 show zones · 6 test Discord · 7 screenshot · 8 debug folder · "
                  "9 test chat\nCalibrate: pick a name, press Capture, then hover the mouse over the "
                  "spot inside Fortnite. *_tl / *_br are the top-left / bottom-right corners of a "
-                 "zone.", bg=BG, fg=DIM, font=FONT_S, wraplength=640, justify="left").pack(
+                 "zone.", bg=BG, fg=DIM, font=FONT_S, wraplength=S(640), justify="left").pack(
             anchor="w", padx=16, pady=6)
 
     def update_current(self):
@@ -1158,25 +1239,36 @@ class SettingsWindow(tk.Toplevel):
 class App:
     def __init__(self):
         self.root = tk.Tk()
+        global SCALE
+        try:
+            SCALE = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+        except Exception:
+            SCALE = 1.0
         self.s = Settings()
         self.q = queue.Queue()
         self.bot = Bot(self.s, self.q)
         self.settings_win = None
         self.root.title(f"Ripple Reborn v{VERSION} — STOPPED")
         self.root.configure(bg=BG)
-        self.root.geometry("430x740+1290+10")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", self.s.bool("options", "always_on_top"))
         setup_style(self.root)
         set_icon(self.root)
         self.build()
+        self.root.update_idletasks()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        ww = max(self.root.winfo_reqwidth(), S(430))
+        wh = min(max(self.root.winfo_reqheight(), S(700)), sh - S(70))
+        wx = TARGET_W + 10 if TARGET_W + 10 + ww <= sw else max(0, sw - ww)
+        self.root.geometry(f"{ww}x{wh}+{wx}+10")
+        self.root.minsize(ww, min(wh, S(560)))
         dark_titlebar(self.root)
         self.log(f"Script ready. Put Fortnite in windowed mode at {TARGET_W}x{TARGET_H} "
                  "('Position window' button).")
         self.log(f"Data folder (settings, log, debug): {DATA_DIR}")
         self.log(f"Settings file: {SETTINGS_FILE}  ({'loaded' if self.s.loaded else 'new'})")
-        if not setup_tesseract():
-            self.log("WARNING: Tesseract OCR not found. Install it for OCR features.")
+        if not ocr_ready():
+            self.log("WARNING: no OCR engine found (Windows OCR missing and no Tesseract).")
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.poll()
         if IS_WIN:
@@ -1188,7 +1280,8 @@ class App:
         top = tk.Frame(r, bg=BG)
         top.pack(fill="x", padx=16, pady=(12, 0))
         try:
-            self.logo = tk.PhotoImage(file=resource("logo.png")).subsample(5, 5)  # 256 -> ~51px
+            self.logo = tk.PhotoImage(file=resource("logo.png")).subsample(
+                *(max(1, round(256 / S(50))),) * 2)
             tk.Label(top, image=self.logo, bg=BG).pack(side="left", padx=(0, 10))
         except Exception:
             pass
@@ -1350,15 +1443,17 @@ class App:
 
     def test_ocr(self):
         def go():
-            if not setup_tesseract():
-                self.log("Tesseract not found - install it first.")
+            if not ocr_ready():
+                self.log("No OCR engine available.")
                 return
             b = self.bot
             b.rect()
             p = ocr_number(b.zone_img("players"))
             lobby = ocr_text(b.zone_img("lobby")).replace("\n", " ")
             banner = ocr_text(b.zone_img("banner")).replace("\n", " ")
-            self.log(f"OCR: players={p}  lobby='{lobby[:30]}'  banner='{banner[:30]}'")
+            if OCR_ERROR:
+                self.log(f"OCR engine error: {OCR_ERROR}")
+            self.log(f"OCR ({'Windows' if _WINOCR else 'Tesseract'}): players={p}  lobby='{lobby[:30]}'  banner='{banner[:30]}'")
         self.run_bg(go)
 
     def test_leave(self):
