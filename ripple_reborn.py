@@ -44,7 +44,6 @@ except ImportError:  # pragma: no cover
 VERSION = "1.0"
 APP = "RippleReborn"
 IS_WIN = sys.platform == "win32"
-TARGET_W, TARGET_H = 1280, 720
 
 DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.ini")
@@ -60,7 +59,6 @@ os.makedirs(DEBUG_DIR, exist_ok=True)
 POINTS = {
     "play": (0.100, 0.668),          # lobby PLAY button (fallback if OCR cannot find it)
     "mode": (0.288, 0.668),          # the "..." next to PLAY (opens the mode list)
-    "quads": (0.200, 0.400),         # "Quads" entry in the mode list
     "leave_menu": (0.500, 0.640),    # "Leave match" in the Esc menu
     "leave_confirm": (0.420, 0.600), # confirm-leave button
     "play_again": (0.880, 0.940),    # play again on the results screen
@@ -72,7 +70,40 @@ ZONES = {
     "banner": (0.250, 0.200, 0.750, 0.330),    # item-found banner
     "feed": (0.010, 0.350, 0.300, 0.600),      # elimination / reboot feed
 }
-POINTS_VERSION = "3"
+POINTS_VERSION = "4"
+# Fortnite pins HUD pieces to the top, bottom or middle of the screen. Positions are stored
+# for a 16:9 picture and mapped onto taller screens (16:10) from that anchor.
+ANCHOR = {"play": "bottom", "mode": "bottom", "quads": "center", "leave_menu": "center",
+          "leave_confirm": "center", "play_again": "bottom", "players": "top", "lobby": "top",
+          "results": "top", "banner": "center", "feed": "bottom"}
+
+
+def anchor_of(name):
+    return ANCHOR.get(name, ANCHOR.get(name.rsplit("_", 1)[0], "center"))
+
+
+def frac_to_px(fx, fy, anchor, w, h):
+    href = min(h, w * 9 / 16)
+    if anchor == "top":
+        py = fy * href
+    elif anchor == "bottom":
+        py = h - (1 - fy) * href
+    else:
+        py = (h - href) / 2 + fy * href
+    return fx * w, py
+
+
+def px_to_frac(px, py, anchor, w, h):
+    href = min(h, w * 9 / 16)
+    if anchor == "top":
+        fy = py / href
+    elif anchor == "bottom":
+        fy = 1 - (h - py) / href
+    else:
+        fy = (py - (h - href) / 2) / href
+    return px / w, fy
+
+
 CAL_NAMES = list(POINTS) + [f"{z}_{c}" for z in ZONES for c in ("tl", "br")]
 
 DEFAULTS = {
@@ -420,22 +451,14 @@ def client_rect(hwnd):
     return pt.x, pt.y, rc.right - rc.left, rc.bottom - rc.top
 
 
-def position_fortnite(hwnd):
-    """Move Fortnite to the top-left and size its client area to 1280x720."""
-    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-    outer = wintypes.RECT()
-    user32.GetWindowRect(hwnd, ctypes.byref(outer))
-    _, _, cw, ch = client_rect(hwnd)
-    ow = (outer.right - outer.left) - cw + TARGET_W
-    oh = (outer.bottom - outer.top) - ch + TARGET_H
-    user32.SetWindowPos(hwnd, 0, 0, 0, ow, oh, 0x0040)  # SWP_SHOWWINDOW
-    time.sleep(0.4)
-    return client_rect(hwnd)
-
-
 def focus(hwnd):
-    user32.ShowWindow(hwnd, 9)
+    if not hwnd or user32.GetForegroundWindow() == hwnd:
+        return
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)
+    user32.keybd_event(0x12, 0, 0, 0)        # a tap of Alt lets us take the foreground
     user32.SetForegroundWindow(hwnd)
+    user32.keybd_event(0x12, 0, 0x0002, 0)
     time.sleep(0.25)
 
 
@@ -571,6 +594,47 @@ def ocr_words(img, inv=False):
         if t.strip():
             out.append((t, d["left"][i] / 3, d["top"][i] / 3, d["width"][i] / 3, d["height"][i] / 3))
     return out
+
+
+def find_yellow_buttons(img):
+    """Bright-yellow rectangles (Fortnite's PLAY button). Boxes in img pixels, biggest first."""
+    W, H = img.size
+    sc = 320.0 / W
+    small = img.convert("RGB").resize((320, max(1, int(H * sc))), Image.BILINEAR)
+    w, h = small.size
+    data = small.load()
+    n_px = w * h
+    mask = bytearray(n_px)
+    for yy in range(h):
+        row = yy * w
+        for xx in range(w):
+            r, g, b = data[xx, yy]
+            if r > 185 and g > 185 and b < 120 and abs(r - g) < 70:
+                mask[row + xx] = 1
+    seen = bytearray(n_px)
+    boxes = []
+    for i in range(n_px):
+        if not mask[i] or seen[i]:
+            continue
+        stack = [i]
+        seen[i] = 1
+        x1 = y1 = 10 ** 9
+        x2 = y2 = -1
+        count = 0
+        while stack:
+            j = stack.pop()
+            xx, yy = j % w, j // w
+            count += 1
+            x1, x2, y1, y2 = min(x1, xx), max(x2, xx), min(y1, yy), max(y2, yy)
+            for k in ((j - 1) if xx > 0 else -1, (j + 1) if xx < w - 1 else -1, j - w, j + w):
+                if 0 <= k < n_px and mask[k] and not seen[k]:
+                    seen[k] = 1
+                    stack.append(k)
+        bw, bh = x2 - x1 + 1, y2 - y1 + 1
+        if bw >= w * 0.06 and bh >= 4 and 1.8 <= bw / bh <= 8 and count >= 0.45 * bw * bh:
+            boxes.append((count, x1 / sc, y1 / sc, (x2 + 1) / sc, (y2 + 1) / sc))
+    boxes.sort(reverse=True)
+    return [b[1:] for b in boxes]
 
 
 def norm_word(t):
@@ -718,12 +782,18 @@ class Bot:
     def abs_point(self, name):
         x, y, w, h = self.rect()
         fx, fy = self.s.point(name)
-        return x + fx * w, y + fy * h
+        px, py = frac_to_px(fx, fy, anchor_of(name), w, h)
+        return x + px, y + py
 
-    def zone_img(self, name):
+    def zone_box(self, name):
         x, y, w, h = self.rect()
         x1, y1, x2, y2 = self.s.zone(name)
-        box = (int(x + x1 * w), int(y + y1 * h), int(x + x2 * w), int(y + y2 * h))
+        a = anchor_of(name)
+        p1, p2 = frac_to_px(x1, y1, a, w, h), frac_to_px(x2, y2, a, w, h)
+        return (int(x + p1[0]), int(y + p1[1]), int(x + p2[0]), int(y + p2[1]))
+
+    def zone_img(self, name):
+        box = self.zone_box(name)
         img = grab(box)
         if self.s.bool("options", "debug_shots"):
             img.save(os.path.join(DEBUG_DIR, f"{name}_{int(time.time())}.png"))
@@ -742,10 +812,9 @@ class Bot:
         self.click_abs(x, y)
 
     def scan_words(self, region=None, inv=False):
-        """OCR a part of the game (fractions) -> words with absolute screen positions."""
+        """OCR the game (or a zone name) -> words with absolute screen positions."""
         x, y, w, h = self.rect()
-        fx1, fy1, fx2, fy2 = region or (0.0, 0.0, 1.0, 1.0)
-        box = (int(x + fx1 * w), int(y + fy1 * h), int(x + fx2 * w), int(y + fy2 * h))
+        box = self.zone_box(region) if region else (x, y, x + w, y + h)
         img = grab(box)
         mine = own_window_rects()
         out = []
@@ -809,7 +878,7 @@ class Bot:
         if not self.s.bool("options", "ocr_lobby"):
             return None
         for inv in (False, True):
-            ws = self.scan_words(self.s.zone("lobby"), inv)
+            ws = self.scan_words("lobby", inv)
             if len({w["t"] for w in ws} & self.NAV) >= 2:
                 return True
         return False
@@ -818,8 +887,12 @@ class Bot:
         """Used by Test OCR: report what the bot can actually see."""
         x, y, w, h = self.rect()
         self.log(f"Fortnite game area: {w}x{h} at ({x}, {y}).")
-        if any(r[0] < x + w and r[2] > x and r[1] < y + h and r[3] > y for r in own_window_rects()):
-            self.log("Note: a bot window overlaps Fortnite - press Position window first.")
+        boxes = self.yellow_buttons()
+        if boxes:
+            b = boxes[0]
+            self.log(f"Yellow PLAY button at ({int((b[0] + b[2]) / 2 - x)}, {int((b[1] + b[3]) / 2 - y)}).")
+        else:
+            self.log("No yellow PLAY button visible.")
         lobby = self.in_lobby()
         ws = self.scan_words()
         self.log(f"Lobby detected: {lobby}.  Words on screen: {self.words_summary(ws)}")
@@ -899,12 +972,8 @@ class Bot:
             if not ocr_ready():
                 self.log("WARNING: no OCR engine available - OCR features will not work.")
             x, y, w, h = self.rect()
-            if (w, h) != (TARGET_W, TARGET_H) or x > 20 or y > 60:
-                x, y, w, h = position_fortnite(self.hwnd)
-                self.log(f"Moved Fortnite to the top left ({w}x{h}).")
-            covered = [r for r in own_window_rects() if r[0] < x + w and r[2] > x and r[1] < y + h and r[3] > y]
-            if covered:
-                self.log("Note: a bot window overlaps Fortnite - the bot cannot see under it.")
+            self.log(f"Fortnite found: {w}x{h}.")
+            focus(self.hwnd)
             while True:
                 self.cycle()
         except Stopped:
@@ -956,42 +1025,97 @@ class Bot:
                 t0 = time.time()
             self.sleep(2)
 
-    def set_quads(self):
-        self.log("Setting Quads.")
-        self.click_point("mode")
-        self.sleep(1.5)
-        if not self.click_text(["QUADS"], "Quads"):
-            self.log("Quads option not found - calibrate 'mode' (the button that opens the "
-                     "mode list) in Settings > Tools. Skipping.")
-            tap("esc")
-            self.sleep(0.8)
-        else:
-            self.sleep(1.0)
-            self.find_confirm_close()
+    def yellow_buttons(self):
+        """Yellow buttons in the game (absolute screen boxes), ignoring the bot's own windows."""
+        x, y, w, h = self.rect()
+        img = grab((x, y, x + w, y + h))
+        mine = own_window_rects()
+        out = []
+        for bx1, by1, bx2, by2 in find_yellow_buttons(img):
+            b = (x + bx1, y + by1, x + bx2, y + by2)
+            cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            if not any(l <= cx <= r and t <= cy <= bt for l, t, r, bt in mine):
+                out.append(b)
+        return out
 
-    def find_confirm_close(self):
-        hit, _ = self.find_text(["CONFIRM", "ACCEPT", "DONE", "OK"])
-        if hit:
+    def panel_open(self, ws=None):
+        """The mode panel: BUILD / ZERO BUILD, Ranked, Team Size, Team Fill, PLAY / DONE."""
+        ws = self.scan_words() if ws is None else ws
+        t = {w["t"] for w in ws}
+        return ("TEAM" in t and ("SIZE" in t or "FILL" in t)) or ("DONE" in t and "RANKED" in t), ws
+
+    def ensure_squad(self, play_box, ws):
+        """Team Size row: the 4th (right-most) icon is Squad. Located from the PLAY button."""
+        x1, y1, x2, y2 = play_box
+        u = (x2 - x1) / 232.0                  # PLAY button is 232 px wide at 1280x720
+        ix, iy = x1 + 373 * u, (y1 + y2) / 2 - 387 * u
+        row = {w["t"] for w in ws if abs(w["cy"] - iy) < 45 * u and w["cx"] < ix}
+        if row & {"SQUAD", "SQUADS"}:
+            self.log("Team size is already Squad.")
+            return
+        self.log(f"Setting team size to Squad (was: {' '.join(sorted(row)) or 'unknown'}).")
+        self.click_abs(ix, iy)
+        self.sleep(1.0)
+
+    def press_play(self, label="PLAY"):
+        boxes = self.yellow_buttons()
+        if boxes:
+            b = boxes[0]
+            cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            self.log(f"Clicking {label} (yellow button) at ({int(cx)}, {int(cy)}).")
+            self.click_abs(cx, cy)
+            return b
+        self.click_text(["PLAY"], label, fallback="play", min_fy=0.12)
+        return None
+
+    def queued(self, ws):
+        t = {w["t"] for w in ws}
+        if t & {"CANCEL", "SEARCHING", "QUEUE", "QUEUED", "LOADING", "CONNECTING"}:
+            return True
+        return not self.yellow_buttons() and not self.panel_open(ws)[0]
+
+    def open_mode_panel(self):
+        """Click the mode name in the lobby (e.g. 'BATTLE ROYALE - ZERO BUILD') to open the panel."""
+        hit, _ = self.find_text(["ROYALE", "BATTLE"], pick="first")
+        if hit and hit["fy"] < 0.35:
+            self.log("Opening the mode panel.")
             self.click_abs(hit["cx"], hit["cy"])
-            self.sleep(1.0)
+            self.sleep(2.0)
+            opened, _ = self.panel_open()
+            if opened:
+                return True
+            if not self.in_lobby():
+                tap("esc")       # something else opened - go back
+                self.sleep(1.0)
+        return False
 
     def queue_game(self):
-        """Press PLAY and make sure the game really started queueing."""
+        """Get from the lobby into matchmaking, setting Squad on the way if asked."""
+        want_squad = self.s.bool("options", "set_quads")
+        if want_squad:
+            self.open_mode_panel()
         for attempt in range(1, 4):
-            self.click_text(["PLAY"], "PLAY", fallback="play", min_fy=0.12)
-            self.sleep(4)
-            in_lobby = self.in_lobby()
-            ws = self.scan_words()
-            queued = {w["t"] for w in ws} & {"CANCEL", "SEARCHING", "LOADING", "QUEUE"}
-            if in_lobby is False or queued:
+            opened, ws = self.panel_open()
+            if not opened:
+                self.press_play()
+                self.sleep(3)
+                opened, ws = self.panel_open()
+            if opened:
+                boxes = self.yellow_buttons()
+                if want_squad and boxes:
+                    self.ensure_squad(boxes[0], ws)
+                self.press_play("PLAY in the mode panel")
+                self.sleep(3)
+                ws = self.scan_words()
+            if self.queued(ws):
                 return True
-            self.log(f"PLAY click {attempt}: still in the lobby. Saw: {self.words_summary(ws)}")
+            self.log(f"PLAY attempt {attempt}: not in matchmaking yet. Saw: {self.words_summary(ws)}")
             self.sleep(2)
         try:
             self.full_shot().save(os.path.join(DEBUG_DIR, f"noplay_{int(time.time())}.png"))
         except Exception:
             pass
-        self.log("Could not confirm the game started queueing. Run Test OCR and send me the log.")
+        self.log("Could not confirm matchmaking started (screenshot saved in the debug folder).")
         return False
 
     def cycle(self):
@@ -999,8 +1123,6 @@ class Bot:
         self.wait_lobby()
         self.status("In lobby", "Settling...")
         self.sleep(self.s.int("match", "lobby_settle"))
-        if self.s.bool("options", "set_quads"):
-            self.set_quads()
         self.queue_game()
         self.stats["matches"] += 1
         self.push_stats()
@@ -1013,7 +1135,7 @@ class Bot:
         while True:
             self.check()
             if self.s.bool("options", "ocr_lobby"):
-                gone = 0 if self.in_lobby() else gone + 1
+                gone = 0 if (self.in_lobby() or self.yellow_buttons()) else gone + 1
                 if time.time() - t0 > 300:
                     self.recover("still in lobby after queueing")
                     return
@@ -1425,8 +1547,7 @@ class SettingsWindow(tk.Toplevel):
         top = tk.Frame(f, bg=BG)
         top.pack(fill="x", padx=14, pady=(10, 4))
         for text, cmd in (("Test OCR", self.app.test_ocr), ("Show zones", self.app.show_zones),
-                          ("Test leave", self.app.test_leave),
-                          ("Position window", self.app.position_window)):
+                          ("Test leave", self.app.test_leave)):
             flat_button(top, text, cmd).pack(side="left", expand=True, fill="x", padx=4)
         cal = tk.Frame(f, bg=BG)
         cal.pack(fill="x", padx=14, pady=10)
@@ -1440,7 +1561,7 @@ class SettingsWindow(tk.Toplevel):
         self.cur = tk.Label(cal, bg=BG, fg=DIM, font=FONT)
         self.cur.pack(side="left", padx=10)
         self.update_current()
-        tk.Label(f, text="Hotkeys (Ctrl+Alt+):  1 start · 2 stop · K kill · 3 save position · "
+        tk.Label(f, text="Hotkeys (Ctrl+Alt+):  1 start · 2 stop · K kill · "
                  "4 test OCR · 5 show zones · 6 test Discord · 7 screenshot · 8 debug folder · "
                  "9 test chat\nCalibrate: pick a name, press Capture, then hover the mouse over the "
                  "spot inside Fortnite. *_tl / *_br are the top-left / bottom-right corners of a "
@@ -1464,8 +1585,11 @@ class SettingsWindow(tk.Toplevel):
                 return
             x, y, w, h = client_rect(hwnd)
             mx, my = cursor_pos()
-            fx, fy = (mx - x) / w, (my - y) / h
-            if not (0 <= fx <= 1 and 0 <= fy <= 1):
+            if not (x <= mx <= x + w and y <= my <= y + h):
+                self.cur.config(text="mouse was outside Fortnite")
+                return
+            fx, fy = px_to_frac(mx - x, my - y, anchor_of(name), w, h)
+            if not (0 <= fx <= 1 and -0.2 <= fy <= 1.2):
                 self.cur.config(text="mouse was outside Fortnite")
                 return
             self.s.set("points", name, f"{fx:.4f},{fy:.4f}")
@@ -1504,12 +1628,11 @@ class App:
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         ww = max(self.root.winfo_reqwidth(), S(430))
         wh = min(max(self.root.winfo_reqheight(), S(700)), sh - S(70))
-        wx = TARGET_W + 10 if TARGET_W + 10 + ww <= sw else max(0, sw - ww)
-        self.root.geometry(f"{ww}x{wh}+{wx}+10")
+        self.root.geometry(f"{ww}x{wh}+{max(0, sw - ww - S(30))}+{S(30)}")
         self.root.minsize(ww, min(wh, S(560)))
         dark_titlebar(self.root)
-        self.log(f"Script ready. Put Fortnite in windowed mode at {TARGET_W}x{TARGET_H} "
-                 "('Position window' button).")
+        self.log("Script ready. Set Fortnite to Windowed Fullscreen (1920x1080 or 1920x1200), "
+                 "then press Start or Ctrl+Alt+1.")
         self.log(f"Data folder (settings, log, debug): {DATA_DIR}")
         self.log(f"Settings file: {SETTINGS_FILE}  ({'loaded' if self.s.loaded else 'new'})")
         if not ocr_ready():
@@ -1654,22 +1777,19 @@ class App:
             self.headline.config(text="Stopped")
 
     # --- actions ----------------------------------------------------------
-    def place_beside(self):
-        """Put the bot window right of the 1280x720 Fortnite window."""
-        self.root.update_idletasks()
-        sw = self.root.winfo_screenwidth()
-        ww = self.root.winfo_width()
-        wx = TARGET_W + 20 if TARGET_W + 20 + ww <= sw else max(0, sw - ww)
-        self.root.geometry(f"+{wx}+10")
-
     def toggle_start(self):
         if self.bot.running:
             self.bot.stop()
         else:
-            if self.settings_win and self.settings_win.winfo_exists():
-                self.settings_win.destroy()  # don't let it cover the game
-            self.place_beside()
-            self.bot.start()
+            self.start_bot()
+
+    def start_bot(self):
+        if self.bot.running:
+            return
+        if self.settings_win and self.settings_win.winfo_exists():
+            self.settings_win.destroy()
+        self.root.iconify()          # get out of the way of the game
+        self.bot.start()
 
     def open_settings(self):
         if self.settings_win and self.settings_win.winfo_exists():
@@ -1684,19 +1804,6 @@ class App:
             except Exception as e:
                 self.log(f"ERROR: {e}")
         threading.Thread(target=wrap, daemon=True).start()
-
-    def position_window(self):
-        def go():
-            if not find_fortnite():
-                self.log("Fortnite window not found. Start Fortnite in windowed mode first.")
-                return
-            hwnd = find_fortnite()
-            x, y, w, h = position_fortnite(hwnd)
-            self.call(self.place_beside)
-            self.log("Fortnite moved to the top left." if (w, h) == (TARGET_W, TARGET_H)
-                     else f"Fortnite client is {w}x{h} (wanted {TARGET_W}x{TARGET_H}). "
-                          "Set the in-game resolution to 1280x720 windowed.")
-        self.run_bg(go)
 
     def test_ocr(self):
         def go():
@@ -1753,9 +1860,6 @@ class App:
         else:
             subprocess.Popen(["xdg-open", DEBUG_DIR])
 
-    def save_position(self):
-        self.position_window()
-
     def show_zones(self):
         self.show_marks(list(ZONES), points=False)
 
@@ -1778,38 +1882,40 @@ class App:
             ov.attributes("-alpha", 0.5)
         cv = tk.Canvas(ov, bg=key, highlightthickness=0)
         cv.pack(fill="both", expand=True)
+        def zrect(z):
+            a = anchor_of(z)
+            x1, y1, x2, y2 = self.s.zone(z)
+            p1, p2 = frac_to_px(x1, y1, a, w, h), frac_to_px(x2, y2, a, w, h)
+            cv.create_rectangle(p1[0], p1[1], p2[0], p2[1], outline=PINK, width=3)
+            cv.create_text(p1[0] + 4, p1[1] + 12, text=z, fill=PINK, anchor="w")
+
+        def pmark(n, col):
+            px, py = frac_to_px(*self.s.point(n), anchor_of(n), w, h)
+            cv.create_oval(px - 9, py - 9, px + 9, py + 9, outline=col, width=3)
+            cv.create_text(px + 13, py, text=n, fill=col, anchor="w")
+
         if points:
             for n in names:
-                if n in ZONES or "_" in n and n.rsplit("_", 1)[0] in ZONES:
-                    z = n.rsplit("_", 1)[0]
-                    x1, y1, x2, y2 = self.s.zone(z)
-                    cv.create_rectangle(x1 * w, y1 * h, x2 * w, y2 * h, outline=PINK, width=3)
-                    cv.create_text(x1 * w + 4, y1 * h - 10, text=z, fill=PINK, anchor="w")
+                z = n.rsplit("_", 1)[0]
+                if z in ZONES and n not in POINTS:
+                    zrect(z)
                 else:
-                    px, py = self.s.point(n)
-                    cv.create_oval(px * w - 10, py * h - 10, px * w + 10, py * h + 10,
-                                   outline=PINK, width=3)
-                    cv.create_text(px * w + 14, py * h, text=n, fill=PINK, anchor="w")
+                    pmark(n, PINK)
         else:
             for n in names:
-                x1, y1, x2, y2 = self.s.zone(n)
-                cv.create_rectangle(x1 * w, y1 * h, x2 * w, y2 * h, outline=PINK, width=3)
-                cv.create_text(x1 * w + 4, y1 * h - 10, text=n, fill=PINK, anchor="w")
+                zrect(n)
             for n in POINTS:
-                px, py = self.s.point(n)
-                cv.create_oval(px * w - 8, py * h - 8, px * w + 8, py * h + 8, outline="#4dd0ff", width=3)
-                cv.create_text(px * w + 12, py * h, text=n, fill="#4dd0ff", anchor="w")
+                pmark(n, "#4dd0ff")
         ov.after(6000, ov.destroy)
 
     # --- hotkeys ----------------------------------------------------------
     def hotkey_loop(self):
         MOD = 0x0001 | 0x0002 | 0x4000  # ALT | CTRL | NOREPEAT
         actions = {
-            "1": lambda: self.call(self.bot.start),
+            "1": lambda: self.call(self.start_bot),
             "2": lambda: self.call(self.bot.stop),
             "P": lambda: self.call(self.bot.toggle_pause),
             "K": lambda: self.call(self.kill),
-            "3": lambda: self.call(self.save_position),
             "4": lambda: self.call(self.test_ocr),
             "5": lambda: self.call(self.show_zones),
             "6": lambda: self.call(self.test_discord),
