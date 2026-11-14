@@ -2,6 +2,8 @@ name: Build RippleReborn.exe
 on:
   workflow_dispatch:
   push:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
@@ -20,7 +22,8 @@ jobs:
           Copy-Item "C:\Program Files\Tesseract-OCR\*" tess -Recurse
           Get-ChildItem tess\tessdata -File | Where-Object { $_.Name -notin 'eng.traineddata','osd.traineddata' } | Remove-Item
           pyinstaller --onefile --noconsole --name RippleReborn --icon logo.ico --add-data "logo.png;." --add-data "logo.ico;." --add-data "tess;tesseract" ripple_reborn.py
-      - uses: actions/upload-artifact@v4
+      - uses: softprops/action-gh-release@v2
         with:
-          name: RippleReborn
-          path: dist/RippleReborn.exe
+          tag_name: v1.0-${{ github.run_number }}
+          name: Ripple Reborn v1.0 (build ${{ github.run_number }})
+          files: dist/RippleReborn.exe
