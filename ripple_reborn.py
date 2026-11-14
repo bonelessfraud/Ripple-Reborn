@@ -825,7 +825,7 @@ class Bot:
             cx, cy = box[0] + wx + ww / 2, box[1] + wy + wh / 2
             if any(l <= cx <= r and tp <= cy <= b for l, tp, r, b in mine):
                 continue  # text from the bot's own window, not Fortnite
-            out.append(dict(t=norm_word(t), raw=t, cx=cx, cy=cy, h=wh,
+            out.append(dict(t=norm_word(t), raw=t, cx=cx, cy=cy, h=wh, x1=cx - ww / 2, x2=cx + ww / 2,
                             fx=(cx - x) / w, fy=(cy - y) / h))
         return out
 
@@ -874,6 +874,24 @@ class Bot:
             return n
         return None
 
+    def players_low(self, st, threshold):
+        """Leave on players-left only when the counter is trustworthy:
+        a reading counts once the next reading agrees with it (within 3), counts never go
+        up, and the counter must have shown 40+ earlier in the match (a real start)."""
+        n = self.read_players()
+        if n is None:
+            return False, None
+        prev, st["cand"] = st.get("cand"), n
+        if prev is None or abs(prev - n) > 3:
+            return False, n
+        conf = st.setdefault("conf", [])
+        if conf and n > conf[-1] + 3:
+            if max(conf) >= 40:
+                return False, n                # a trusted counter never goes up: misread
+            conf.clear()                       # earlier low readings were junk - start over
+        conf.append(n)
+        return max(conf) >= 40 and n <= threshold, n
+
     NAV = {"SHOP", "LOCKER", "PASSES", "V-BUCKS", "VBUCKS", "PLAY", "BUCKS"}
 
     def in_lobby(self):
@@ -906,6 +924,12 @@ class Bot:
         else:
             self.log("No PLAY button found (open the lobby with the Play tab showing).")
         self.log(f"Players-left counter reads: {ocr_number(self.zone_img('players'))}")
+        rows = self.find_team_rows()
+        if rows:
+            self.classify_rows(rows)
+            self.log("Squad: " + ",  ".join(f"{r['key']} {r['now']} {r['dbg']}" for r in rows))
+        else:
+            self.log("Squad list: no teammate names found (only shows in a match).")
         if OCR_ERROR:
             self.log(f"OCR engine error: {OCR_ERROR}")
         p = os.path.join(DEBUG_DIR, f"diag_{int(time.time())}.png")
@@ -1092,6 +1116,141 @@ class Bot:
     def key(text):
         return re.sub(r"[^a-z0-9]", "", text.lower())
 
+    # ---------------------------------------------------------------- squad list
+    # Each teammate row in the bottom-left: name, then shield (blue) + health (green) bars.
+    #   ALIVE    green health bar
+    #   KNOCKED  red bar + red "+" circle             (white name)
+    #   DEAD     red/pink name + cyan reboot-card / power icon, no green or red bar
+    @staticmethod
+    def _is_green(r, g, b):
+        return g > 140 and g > r + 40 and g > b + 30
+
+    @staticmethod
+    def _is_red(r, g, b):
+        return r > 170 and g < 90 and b < 130 and r - g > 110
+
+    @staticmethod
+    def _is_pink(r, g, b):
+        return r > 170 and g < 125 and 45 <= b <= 190 and r - g > 85
+
+    @staticmethod
+    def _is_cyan(r, g, b):
+        return b > 180 and g > 140 and r < 120
+
+    @staticmethod
+    def _is_white(r, g, b):
+        return r > 205 and g > 205 and b > 205
+
+    def find_team_rows(self):
+        """Locate teammate rows (name boxes) in the squad list with OCR."""
+        rows = []
+        for inv in (False, True):
+            for line in self.text_lines(self.scan_words("team", inv)):
+                words = [w for w in line if len(self.key(w["raw"])) >= 2]
+                if not words:
+                    continue
+                k = max((self.key(w["raw"]) for w in words), key=len)
+                if len(k) < 4 or not any(c.isalpha() for c in k):
+                    continue
+                if any(r["key"] == k[:6] for r in rows):
+                    continue
+                nw = max(words, key=lambda w: len(self.key(w["raw"])))   # longest word of the name
+                h = nw["h"]
+                # names can be several words ("beto on fortnite"): grow left/right over close words
+                ws_ = sorted(words, key=lambda w: w["x1"])
+                i = ws_.index(nw)
+                lo = hi = i
+                while lo > 0 and ws_[lo]["x1"] - ws_[lo - 1]["x2"] < 1.2 * h:
+                    lo -= 1
+                while hi < len(ws_) - 1 and ws_[hi + 1]["x1"] - ws_[hi]["x2"] < 1.2 * h:
+                    hi += 1
+                name = ws_[lo:hi + 1]
+                rows.append(dict(key=k[:6], x1=name[0]["x1"], x2=name[-1]["x2"], y1=nw["cy"] - h / 2,
+                                 y2=nw["cy"] + h / 2, h=h, streak={}, state="?"))
+            if len(rows) >= 2:
+                break
+        rows.sort(key=lambda r: r["y1"])
+        if rows:
+            xs = sorted(r["x1"] for r in rows)
+            mid = xs[len(xs) // 2]
+            rows = [r for r in rows if abs(r["x1"] - mid) <= 1.5 * r["h"]]   # names line up
+            kept = []
+            for r in rows:                     # bar text read as junk sits too close to a name
+                if kept and r["y1"] - kept[-1]["y1"] < 1.4 * kept[-1]["h"]:
+                    continue
+                kept.append(r)
+            rows = kept
+        return rows[:3]
+
+    def classify_rows(self, rows, img=None, origin=None):
+        """Set row['now'] to ALIVE / KNOCKED / DEAD / ? from the pixels."""
+        if img is None:
+            box = self.zone_box("team")
+            pad = int(rows[0]["h"] * 4) if rows else 40
+            box = (box[0], box[1], box[2] + pad, box[3] + pad)
+            img = grab(box)
+            origin = box[:2]
+        ox, oy = origin
+        px = img.load()
+        W, H = img.size
+
+        def clip(x1, y1, x2, y2):
+            return (max(0, int(x1 - ox)), max(0, int(y1 - oy)), min(W, int(x2 - ox)), min(H, int(y2 - oy)))
+
+        for i, r in enumerate(rows):
+            h = r["h"]
+            right = r["x1"] + 16 * h                       # end of the row incl. the icon
+            nxt = rows[i + 1]["y1"] if i + 1 < len(rows) else r["y2"] + 3 * h
+            # bar area: just under the name, from the name's left edge to the row's end
+            bx1, by1, bx2, by2 = clip(r["x1"] - h, r["y2"] + 0.15 * h, r["x1"] + 11 * h,
+                                      min(r["y2"] + 2.2 * h, nxt - 0.1 * h))
+            bw = max(1, bx2 - bx1)
+            best_g = best_r = 0
+            for yy in range(by1, by2):
+                rg = rr = 0
+                for xx in range(bx1, bx2):
+                    c = px[xx, yy][:3]
+                    rg = rg + 1 if self._is_green(*c) else 0
+                    rr = rr + 1 if self._is_red(*c) else 0
+                    best_g, best_r = max(best_g, rg), max(best_r, rr)
+            # reboot icon: right part of the row, from the name line down to the bar
+            ix1, iy1, ix2, iy2 = clip(r["x1"] + 5 * h, r["y1"] - 0.5 * h, right,
+                                      min(r["y2"] + 2.5 * h, nxt - 0.1 * h))
+            cyan = sum(1 for yy in range(iy1, iy2) for xx in range(ix1, ix2) if self._is_cyan(*px[xx, yy][:3]))
+            # name colour: red/pink when eliminated, white otherwise
+            nx1, ny1, nx2, ny2 = clip(r["x1"], r["y1"], r["x2"], r["y2"])
+            pink = white = 0
+            for yy in range(ny1, ny2):
+                for xx in range(nx1, nx2):
+                    c = px[xx, yy][:3]
+                    pink += self._is_pink(*c)
+                    white += self._is_white(*c)
+            r["dbg"] = dict(green=best_g, red=best_r, cyan=cyan, pink=pink, white=white, bw=bw)
+            if best_g >= max(6, 0.06 * bw):     # any health left shows a green bar
+                r["now"] = "ALIVE"
+            elif best_r >= 0.15 * bw:
+                r["now"] = "KNOCKED"
+            elif pink >= max(10, white) and cyan >= max(6, (0.35 * h) ** 2 * 0.5):
+                r["now"] = "DEAD"
+            else:
+                r["now"] = "?"
+        return rows
+
+    def update_team(self, rows):
+        """Debounce: a new state counts after 3 readings in a row. Returns names now DEAD."""
+        self.classify_rows(rows)
+        for r in rows:
+            now = r["now"]
+            if now == "?":
+                continue
+            r["streak"] = {now: r["streak"].get(now, 0) + 1}
+            if r["streak"][now] >= 3 and r["state"] != now:
+                old, r["state"] = r["state"], now
+                label = {"ALIVE": "is up" if old in ("KNOCKED", "DEAD") else "alive",
+                         "KNOCKED": "knocked", "DEAD": "ELIMINATED"}[now]
+                self.log(f"Teammate {r['key']}: {label}")
+        return [r["key"] for r in rows if r["state"] == "DEAD"]
+
     def read_team(self):
         """Teammate names from the squad list in the bottom-left corner."""
         names = []
@@ -1105,26 +1264,56 @@ class Bot:
                 break
         return names[:3]
 
+    COUNT_RE = re.compile(r"^[\(\[]\d{1,3}[\)\]]?$|^\d{1,3}[\)\]]$")
+
+    def parse_feed_line(self, raws):
+        """'Killer (21) verb Victim (48) with an SMG' -> (killer, verb, victim) keys, or None.
+
+        Every elimination line has the killer's elimination count in brackets right after the
+        killer's name; the victim's name is the word(s) just before their own count."""
+        toks = [t for t in raws if t.strip()]
+        idx = [i for i, t in enumerate(toks) if self.COUNT_RE.match(t.strip())]
+        if not idx:
+            # names glued to the count, e.g. 'Anonymous[288]'
+            idx = [i for i, t in enumerate(toks) if re.search(r"[\(\[]\d{1,3}[\)\]]?$", t)]
+        if not idx or idx[0] == 0:
+            return None
+        killer = self.key("".join(toks[max(0, idx[0] - 3):idx[0]]))
+        after = toks[idx[0] + 1:]
+        if len(idx) > 1:
+            end = idx[1] - idx[0] - 1
+            if re.search(r"[\(\[]\d", toks[idx[1]]) and not self.COUNT_RE.match(toks[idx[1]].strip()):
+                end += 1                       # count glued onto the victim's name
+            middle = after[:end]
+        else:
+            middle = [t for t in after if t.lower() not in ("with", "an", "a", "the")]
+            if "with" in [t.lower() for t in after]:
+                middle = after[:[t.lower() for t in after].index("with")]
+        if not middle:
+            return None
+        verb = self.key(" ".join(middle[:2]))
+        victim = self.key("".join(middle[-3:]))
+        return killer, verb, victim
+
     def check_team_out(self, team, out):
-        """Add teammates the kill feed shows as eliminated (not knocked) to `out`."""
+        """Add teammates the kill feed shows as ELIMINATED (the victim, not knocked) to `out`."""
         for line in self.text_lines(self.scan_words("feed")):
-            words = [self.key(w["raw"]) for w in line]
-            words = [w for w in words if w]
-            if len(words) < 2:
+            raws = [w["raw"] for w in line]
+            full = self.key("".join(raws))
+            if any(k in full for k in ("knocked", "downed", "revived", "rebooted", "reboot")):
                 continue
-            full = "".join(words)
-            if any(k in full for k in ("knocked", "revived", "rebooted", "reboot")):
+            parsed = self.parse_feed_line(raws)
+            if not parsed:
                 continue
-            first, rest = words[0], "".join(words[1:])
+            killer, verb, victim = parsed
             for name in team:
-                if name in out:
+                if name in out or name in killer:
                     continue
-                victim = name in rest and not first.startswith(name[:4])
-                self_kill = first.startswith(name[:4]) and \
-                    any(k in full for k in ("storm", "fell", "died", "death"))
-                if victim or self_kill:
-                    out.add(name)
-                    self.log(f"Teammate out: {' '.join(w['raw'] for w in line)}")
+                if name in victim:
+                    self._suspect[name] = self._suspect.get(name, 0) + 1
+                    if self._suspect[name] >= 2:       # seen in two separate scans
+                        out.add(name)
+                        self.log(f"Teammate eliminated: {' '.join(raws)}")
 
     def yellow_buttons(self):
         """Yellow buttons in the game (absolute screen boxes), ignoring the bot's own windows."""
@@ -1267,11 +1456,19 @@ class Bot:
             self.sleep(2)
 
         # ---- bus: wait, then jump ----
+        match_start = time.time()                 # max match length counts from here
+        max_len = self.s.int("match", "max_match_min") * 60
+        self.log(f"Match loaded. Will leave by {time.strftime('%H:%M:%S', time.localtime(match_start + max_len))} "
+                 f"(max {max_len // 60} min).")
+
+        def too_long():
+            return time.time() - match_start >= max_len
+
         self.status("In bus", "")
-        self.sleep(self.s.int("match", "wait_before_jump"))
+        self.sleep(min(self.s.int("match", "wait_before_jump"), max_len))
         proceed = self.s.int("match", "proceed_anyway")
         t1 = time.time()
-        while self.read_players() is None:
+        while self.read_players() is None and not too_long():
             if proceed and time.time() - t1 > proceed:
                 self.log("Counter not readable - proceeding anyway.")
                 break
@@ -1280,37 +1477,56 @@ class Bot:
         tap("space")
         self.log("Jumped from the bus.")
         self.status("Dropping", "")
-        self.sleep(self.s.int("match", "landing_wait"))
+        self.sleep(max(0, min(self.s.int("match", "landing_wait"), max_len - (time.time() - match_start))))
 
         up = self.s.int("options", "look_up")
         if up > 0:
             mouse_move_rel(0, -up)
-        match_start = time.time()
+        landed = time.time()
         sent_first = sent_second = False
-        team, team_out = [], set()
+        rows = []
+        self._suspect = {}
+        self._team_read = 0
+        pstate = {}
         last_banner = 0.0
 
         # ---- in match ----
         while True:
             self.check()
             elapsed = time.time() - match_start
-            self.status("In match", f"{int(elapsed // 60)}m {int(elapsed % 60):02d}s")
+            left = max(0, max_len - elapsed)
+            self.status("In match", f"{int(elapsed // 60)}m {int(elapsed % 60):02d}s  ·  "
+                                    f"leaving in {int(left // 60)}m {int(left % 60):02d}s")
+            if too_long():
+                self.log(f"Max match length ({max_len // 60} min) reached - leaving.")
+                break
 
             if self.s.bool("main", "afk_messages"):
                 if not sent_first:
                     self.chat(self.s.get("text", "afk1"))
                     sent_first = True
-                elif not sent_second and elapsed >= self.s.int("match", "afk_second_msg"):
+                elif not sent_second and time.time() - landed >= self.s.int("match", "afk_second_msg"):
                     self.chat(self.s.get("text", "afk2"))
                     sent_second = True
 
-            players = self.read_players()
-            if players is not None and players <= self.s.int("match", "leave_at_players"):
+            low, players = self.players_low(pstate, self.s.int("match", "leave_at_players"))
+            if low:
                 self.log(f"{players} players left - leaving.")
                 break
-            if elapsed > self.s.int("match", "max_match_min") * 60:
-                self.log("Max match length reached - leaving.")
-                break
+
+            # squad list (bottom left): green = alive, red + "+" = knocked, red name + reboot card = out
+            if self.s.bool("main", "leave_if_team_out"):
+                if len(rows) < 2 and time.time() - getattr(self, "_team_read", 0) > 10:
+                    self._team_read = time.time()
+                    found = self.find_team_rows()
+                    if len(found) > len(rows):
+                        rows = found
+                        self.log(f"Squad list: {', '.join(r['key'] for r in rows)}")
+                if len(rows) >= 2:              # never decide from a half-read squad list
+                    dead = self.update_team(rows)
+                    if len(dead) >= 2:
+                        self.log(f"2 teammates eliminated ({', '.join(dead)}) - leaving.")
+                        break
 
             if time.time() - last_banner > 4:
                 last_banner = time.time()
@@ -1342,21 +1558,9 @@ class Bot:
                             for w in self.s.get("text", "reboot_words").split(",")):
                     self.chat(self.s.get("text", "thanks"))
                     self.sleep(8)
-                if self.s.bool("main", "leave_if_team_out"):
-                    if not team:
-                        team = self.read_team()
-                        if team:
-                            self.log(f"Teammates: {', '.join(team)}")
-                    if team:
-                        before = len(team_out)
-                        self.check_team_out(team, team_out)
-                        need = min(2, len(team))
-                        if len(team_out) != before:
-                            self.log(f"Teammates eliminated: {len(team_out)}/{need}")
-                        if len(team_out) >= need:
-                            self.log("Team is out - leaving.")
-                            break
 
+            if too_long():
+                continue                       # top of the loop logs it and leaves
             if self.s.bool("main", "movement"):
                 self.move_once()
             else:
