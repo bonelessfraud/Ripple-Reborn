@@ -58,8 +58,8 @@ os.makedirs(DEBUG_DIR, exist_ok=True)
 # them in Settings > Tools (Calibrate) if a click lands in the wrong spot.
 # ----------------------------------------------------------------------------
 POINTS = {
-    "play": (0.119, 0.868),          # lobby PLAY button
-    "mode": (0.119, 0.795),          # game-mode selector (above Play)
+    "play": (0.100, 0.668),          # lobby PLAY button (fallback if OCR cannot find it)
+    "mode": (0.288, 0.668),          # the "..." next to PLAY (opens the mode list)
     "quads": (0.200, 0.400),         # "Quads" entry in the mode list
     "leave_menu": (0.500, 0.640),    # "Leave match" in the Esc menu
     "leave_confirm": (0.420, 0.600), # confirm-leave button
@@ -67,11 +67,12 @@ POINTS = {
 }
 ZONES = {
     "players": (0.905, 0.030, 0.985, 0.075),   # players-left counter
-    "lobby": (0.040, 0.835, 0.200, 0.900),     # PLAY button text
+    "lobby": (0.000, 0.000, 1.000, 0.120),     # top menu bar (PLAY SHOP LOCKER ...)
     "results": (0.300, 0.050, 0.700, 0.200),   # results / victory header
     "banner": (0.250, 0.200, 0.750, 0.330),    # item-found banner
     "feed": (0.010, 0.350, 0.300, 0.600),      # elimination / reboot feed
 }
+POINTS_VERSION = "3"
 CAL_NAMES = list(POINTS) + [f"{z}_{c}" for z in ZONES for c in ("tl", "br")]
 
 DEFAULTS = {
@@ -180,6 +181,24 @@ class Settings:
             except configparser.Error:
                 pass
         self.lock = threading.Lock()
+        raw = configparser.ConfigParser(interpolation=None)
+        try:
+            raw.read(SETTINGS_FILE, encoding="utf-8")
+        except configparser.Error:
+            pass
+        if raw.get("meta", "points_version", fallback="") != POINTS_VERSION:
+            # positions from older builds were guesses: reset them once
+            for k, v in DEFAULTS["points"].items():
+                self.cp.set("points", k, v)
+            if not self.cp.has_section("meta"):
+                self.cp.add_section("meta")
+            self.cp.set("meta", "points_version", POINTS_VERSION)
+            if self.loaded:
+                try:
+                    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                        self.cp.write(f)
+                except OSError:
+                    pass
 
     def get(self, sec, key):
         return self.cp.get(sec, key, fallback=DEFAULTS.get(sec, {}).get(key, ""))
@@ -303,12 +322,27 @@ def mouse_button(down_flag, up_flag, hold=0.06):
         time.sleep(hold)
 
 
+def move_abs(x, y):
+    """Move the cursor with a real mouse-move event (games ignore silent SetCursorPos)."""
+    if not IS_WIN:
+        return
+    vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+    vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+    nx = int((x - vx) * 65535 / max(1, vw - 1))
+    ny = int((y - vy) * 65535 / max(1, vh - 1))
+    inp = INPUT(type=0)
+    inp.u.mi = MOUSEINPUT(nx, ny, 0, 0x0001 | 0x8000 | 0x4000, 0, 0)
+    _send(inp)
+
+
 def click(x, y):
     if not IS_WIN:
         return
-    user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.12)
-    mouse_button(0x0002, 0x0004)
+    move_abs(x - 8, y - 5)
+    time.sleep(0.10)
+    move_abs(x, y)
+    time.sleep(0.25)
+    mouse_button(0x0002, 0x0004, hold=0.10)
 
 
 def mouse_move_rel(dx, dy, steps=12, total_time=0.25):
@@ -433,7 +467,7 @@ def ocr_ready():
     return bool(_load_winocr()) or setup_tesseract()
 
 
-async def _winocr_async(png):
+async def _winocr_async(png, want_words=False):
     OcrEngine, BitmapDecoder, Stream, Writer = _WINOCR
     stream = Stream()
     w = Writer(stream)
@@ -445,6 +479,13 @@ async def _winocr_async(png):
     bmp = await dec.get_software_bitmap_async()
     eng = OcrEngine.try_create_from_user_profile_languages()
     res = await eng.recognize_async(bmp)
+    if want_words:
+        out = []
+        for line in res.lines:
+            for wd in line.words:
+                r = wd.bounding_rect
+                out.append((wd.text, r.x, r.y, r.width, r.height))
+        return out
     return res.text
 
 
@@ -465,6 +506,52 @@ def _winocr(img):
     except Exception as e:
         OCR_ERROR = str(e)
         return ""
+
+
+def _winocr_words(img):
+    global OCR_ERROR
+    import asyncio
+    if not getattr(_tls, "init", False):
+        _tls.init = True
+        try:
+            from winrt.runtime import init_apartment
+            init_apartment()
+        except Exception:
+            pass
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    try:
+        return asyncio.run(_winocr_async(buf.getvalue(), True))
+    except Exception as e:
+        OCR_ERROR = str(e)
+        return []
+
+
+def ocr_words(img, inv=False):
+    """[(text, x, y, w, h)] with positions in the pixels of `img`."""
+    sc = min(2.0, 2500.0 / max(img.size))
+    if _load_winocr():
+        g = ImageOps.autocontrast(ImageOps.grayscale(img))
+        g = g.resize((max(1, int(g.width * sc)), max(1, int(g.height * sc))), Image.LANCZOS)
+        if inv:
+            g = ImageOps.invert(g)
+        return [(t, x / sc, y / sc, w / sc, h / sc) for t, x, y, w, h in _winocr_words(g)]
+    if pytesseract is None:
+        return []
+    try:
+        d = pytesseract.image_to_data(prep(img, inv), config="--psm 11",
+                                      output_type=pytesseract.Output.DICT)
+    except Exception:
+        return []
+    out = []
+    for i, t in enumerate(d["text"]):
+        if t.strip():
+            out.append((t, d["left"][i] / 3, d["top"][i] / 3, d["width"][i] / 3, d["height"][i] / 3))
+    return out
+
+
+def norm_word(t):
+    return re.sub(r"[^A-Z0-9-]", "", t.upper())
 
 
 def prep(img, invert=False, binarize=True):
@@ -623,10 +710,55 @@ class Bot:
         x, y, w, h = self.rect()
         return grab((x, y, x + w, y + h))
 
-    def click_point(self, name):
+    def click_abs(self, x, y):
         focus(self.hwnd or find_fortnite())
-        x, y = self.abs_point(name)
         click(x, y)
+
+    def click_point(self, name):
+        x, y = self.abs_point(name)
+        self.click_abs(x, y)
+
+    def scan_words(self, region=None, inv=False):
+        """OCR a part of the game (fractions) -> words with absolute screen positions."""
+        x, y, w, h = self.rect()
+        fx1, fy1, fx2, fy2 = region or (0.0, 0.0, 1.0, 1.0)
+        box = (int(x + fx1 * w), int(y + fy1 * h), int(x + fx2 * w), int(y + fy2 * h))
+        img = grab(box)
+        out = []
+        for t, wx, wy, ww, wh in ocr_words(img, inv):
+            out.append(dict(t=norm_word(t), raw=t, cx=box[0] + wx + ww / 2, cy=box[1] + wy + wh / 2,
+                            h=wh, fy=(box[1] + wy + wh / 2 - y) / h))
+        return out
+
+    def find_text(self, targets, region=None, pick="largest", min_fy=0.0):
+        """Look for a word on screen. Returns (hit or None, all words seen)."""
+        targets = {norm_word(t) for t in targets}
+        seen = []
+        for inv in (False, True):
+            ws = self.scan_words(region, inv)
+            seen = seen or ws
+            hits = [w for w in ws if w["t"] in targets and w["fy"] >= min_fy]
+            if hits:
+                hits.sort(key=(lambda w: -w["h"]) if pick == "largest" else (lambda w: w["fy"]))
+                return hits[0], ws
+        return None, seen
+
+    def click_text(self, targets, label, fallback=None, **kw):
+        hit, seen = self.find_text(targets, **kw)
+        if hit:
+            self.log(f"Clicking {label} at ({int(hit['cx'])}, {int(hit['cy'])}) [found on screen]")
+            self.click_abs(hit["cx"], hit["cy"])
+            return True
+        if fallback:
+            x, y = self.abs_point(fallback)
+            self.log(f"{label} not found by OCR - clicking calibrated spot ({int(x)}, {int(y)})")
+            self.click_abs(x, y)
+        else:
+            self.log(f"{label} not found on screen.")
+        return False
+
+    def words_summary(self, ws, n=25):
+        return " ".join(w["t"] for w in ws if w["t"])[:n * 8] or "(nothing readable)"
 
     def has_words(self, zone, words):
         text = ocr_text(self.zone_img(zone)).lower()
@@ -640,10 +772,37 @@ class Bot:
             return n
         return None
 
+    NAV = {"SHOP", "LOCKER", "PASSES", "V-BUCKS", "VBUCKS", "PLAY", "BUCKS"}
+
     def in_lobby(self):
+        """True when the main menu bar (PLAY / SHOP / LOCKER ...) is visible."""
         if not self.s.bool("options", "ocr_lobby"):
             return None
-        return "play" in ocr_text(self.zone_img("lobby")).lower()
+        for inv in (False, True):
+            ws = self.scan_words(self.s.zone("lobby"), inv)
+            if len({w["t"] for w in ws} & self.NAV) >= 2:
+                return True
+        return False
+
+    def diagnose(self):
+        """Used by Test OCR: report what the bot can actually see."""
+        self.rect()
+        lobby = self.in_lobby()
+        ws = self.scan_words()
+        self.log(f"Lobby detected: {lobby}.  Words on screen: {self.words_summary(ws)}")
+        hit, _ = self.find_text(["PLAY"], min_fy=0.12)
+        if hit:
+            x, y, w, h = self.rect()
+            self.log(f"PLAY button found at ({int(hit['cx'] - x)}, {int(hit['cy'] - y)}) in the game "
+                     f"= {(hit['cx'] - x) / w:.3f}, {(hit['cy'] - y) / h:.3f}")
+        else:
+            self.log("No PLAY button found (open the lobby with the Play tab showing).")
+        self.log(f"Players-left counter reads: {ocr_number(self.zone_img('players'))}")
+        if OCR_ERROR:
+            self.log(f"OCR engine error: {OCR_ERROR}")
+        p = os.path.join(DEBUG_DIR, f"diag_{int(time.time())}.png")
+        self.full_shot().save(p)
+        self.log(f"Saved what the bot sees: {p}")
 
     # --- in-game actions ---------------------------------------------------
     def chat(self, text):
@@ -660,10 +819,15 @@ class Bot:
         self.log("Leaving the match.")
         focus(self.hwnd)
         tap("esc")
-        self.sleep(1.0)
-        self.click_point("leave_menu")
-        self.sleep(1.0)
-        self.click_point("leave_confirm")
+        self.sleep(1.2)
+        self.click_text(["LEAVE"], "Leave match", fallback="leave_menu", pick="first")
+        self.sleep(1.5)
+        hit, _ = self.find_text(["LEAVE", "CONFIRM", "YES"], pick="first")
+        if hit:
+            self.log("Confirming leave.")
+            self.click_abs(hit["cx"], hit["cy"])
+        elif not self.in_lobby():
+            self.click_point("leave_confirm")
 
     def move_once(self):
         pick, gun = self.s.get("options", "pickaxe_key"), self.s.get("options", "gun_key")
@@ -720,6 +884,12 @@ class Bot:
         self.stats["recoveries"] += 1
         self.push_stats()
         self.log(f"Recovering: {why}")
+        try:
+            ws = self.scan_words()
+            self.log(f"On screen: {self.words_summary(ws)}")
+            self.full_shot().save(os.path.join(DEBUG_DIR, f"stuck_{int(time.time())}.png"))
+        except Exception:
+            pass
         focus(self.hwnd)
         for _ in range(3):
             tap("esc")
@@ -731,21 +901,60 @@ class Bot:
         t0 = time.time()
         while True:
             self.check()
-            if self.s.bool("main", "play_again") and \
-                    self.has_words("results", "victory,eliminated,results,play again"):
-                self.log("Results screen - play again.")
-                self.click_point("play_again")
-                self.sleep(3)
+            if self.s.bool("main", "play_again"):
+                hit, _ = self.find_text(["AGAIN"])
+                if hit:
+                    self.log("Results screen - Play again.")
+                    self.click_abs(hit["cx"], hit["cy"])
+                    self.sleep(3)
             lobby = self.in_lobby()
             if lobby is None:  # OCR detection disabled: just give the game time
                 self.sleep(self.s.int("match", "lobby_settle"))
                 return
             if lobby:
                 return
-            if time.time() - t0 > 120:
-                self.recover("lobby not detected after 2 minutes")
+            if time.time() - t0 > 90:
+                self.recover("lobby not detected after 90 seconds")
                 t0 = time.time()
             self.sleep(2)
+
+    def set_quads(self):
+        self.log("Setting Quads.")
+        self.click_point("mode")
+        self.sleep(1.5)
+        if not self.click_text(["QUADS"], "Quads"):
+            self.log("Quads option not found - calibrate 'mode' (the button that opens the "
+                     "mode list) in Settings > Tools. Skipping.")
+            tap("esc")
+            self.sleep(0.8)
+        else:
+            self.sleep(1.0)
+            self.find_confirm_close()
+
+    def find_confirm_close(self):
+        hit, _ = self.find_text(["CONFIRM", "ACCEPT", "DONE", "OK"])
+        if hit:
+            self.click_abs(hit["cx"], hit["cy"])
+            self.sleep(1.0)
+
+    def queue_game(self):
+        """Press PLAY and make sure the game really started queueing."""
+        for attempt in range(1, 4):
+            self.click_text(["PLAY"], "PLAY", fallback="play", min_fy=0.12)
+            self.sleep(4)
+            in_lobby = self.in_lobby()
+            ws = self.scan_words()
+            queued = {w["t"] for w in ws} & {"CANCEL", "MATCHMAKING", "SEARCHING", "LOADING", "QUEUE"}
+            if in_lobby is False or queued:
+                return True
+            self.log(f"PLAY click {attempt}: still in the lobby. Saw: {self.words_summary(ws)}")
+            self.sleep(2)
+        try:
+            self.full_shot().save(os.path.join(DEBUG_DIR, f"noplay_{int(time.time())}.png"))
+        except Exception:
+            pass
+        self.log("Could not confirm the game started queueing. Run Test OCR and send me the log.")
+        return False
 
     def cycle(self):
         # ---- lobby ----
@@ -753,28 +962,26 @@ class Bot:
         self.status("In lobby", "Settling...")
         self.sleep(self.s.int("match", "lobby_settle"))
         if self.s.bool("options", "set_quads"):
-            self.log("Setting Quads.")
-            self.click_point("mode")
-            self.sleep(1.2)
-            self.click_point("quads")
-            self.sleep(1.0)
-        self.click_point("play")
+            self.set_quads()
+        self.queue_game()
         self.stats["matches"] += 1
         self.push_stats()
         self.status("Queueing", f"Match {self.stats['matches']}")
         self.log(f"Queued match {self.stats['matches']}.")
 
-        # ---- wait for the game to load (lobby text disappears) ----
+        # ---- wait for the game to load (menu bar disappears) ----
         t0 = time.time()
+        gone = 0
         while True:
             self.check()
-            if self.s.bool("options", "ocr_lobby") and self.in_lobby():
-                if time.time() - t0 > 240:
+            if self.s.bool("options", "ocr_lobby"):
+                gone = 0 if self.in_lobby() else gone + 1
+                if time.time() - t0 > 300:
                     self.recover("still in lobby after queueing")
                     return
-                self.sleep(2)
-                continue
-            if self.read_players() is not None or time.time() - t0 > 240:
+                if gone >= 2:
+                    break
+            elif self.read_players() is not None or time.time() - t0 > 240:
                 break
             self.sleep(2)
 
@@ -1446,14 +1653,8 @@ class App:
             if not ocr_ready():
                 self.log("No OCR engine available.")
                 return
-            b = self.bot
-            b.rect()
-            p = ocr_number(b.zone_img("players"))
-            lobby = ocr_text(b.zone_img("lobby")).replace("\n", " ")
-            banner = ocr_text(b.zone_img("banner")).replace("\n", " ")
-            if OCR_ERROR:
-                self.log(f"OCR engine error: {OCR_ERROR}")
-            self.log(f"OCR ({'Windows' if _WINOCR else 'Tesseract'}): players={p}  lobby='{lobby[:30]}'  banner='{banner[:30]}'")
+            self.log(f"OCR engine: {'Windows' if _load_winocr() else 'Tesseract'}")
+            self.bot.diagnose()
         self.run_bg(go)
 
     def test_leave(self):
