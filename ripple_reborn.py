@@ -1077,21 +1077,28 @@ class Bot:
             claims = [w for w in ws2 if w["t"] == "CLAIM"]
             ws = ws2 if claims else ws
         t = {w["t"] for w in ws}
+        claim_all = any(a["t"] == "ALL" and abs(a["cy"] - c["cy"]) < c["h"] and 0 < a["cx"] - c["cx"] < 8 * c["h"]
+                        for c in claims for a in ws)
+        # only real reward screens - NOT "find it on the map to claim a special ability" banners,
+        # the victory screen's "12 TO CLAIM", etc.
+        reward = "ACQUIRED" in t or claim_all or ("UNLOCKED" in t and t & {"PIRATE", "ACCESS"})
+        if not reward or t & {"SPRITES", "TREASURE"} and not claim_all and "ACQUIRED" not in t:
+            return False
         if not claims:
-            if not t & {"ACQUIRED", "UNLOCKED"}:
-                return False
             # reward screen, but the pale button text was not readable: use its usual spot
             px, py = self.abs_point("claim")
             claims = [dict(t="CLAIM", raw="CLAIM", cx=px, cy=py, h=20, fx=0.58, fy=0.91)]
         # the button is the lowest CLAIM on screen (the description text also says "claim")
         btn = max(claims, key=lambda w: w["cy"])
+        if self.is_forbidden(btn["cx"], btn["cy"], ws, rx=40, ry=12):
+            return False
         if time.time() - getattr(self, "_last_claim", 0) > 10:
             if t & {"PIRATE", "ACCESS"}:
                 what = "Pirate Shop Access"
+            elif "ACQUIRED" in t:
+                what = "Item Acquired"
             else:
-                big = sorted((w for w in ws if w["h"] > btn["h"] * 1.4 and w["t"] not in ("ITEM", "ACQUIRED")),
-                             key=lambda w: (round(w["cy"] / 20), w["cx"]))
-                what = " ".join(w["raw"] for w in big[:5]) or "an item"
+                what = "Reward"
             self.stats["found"] += 1
             self.push_stats()
             self.log(f"Reward screen: {what} - claiming.")
@@ -1398,19 +1405,52 @@ class Bot:
         self.click_abs(ix, iy)
         self.sleep(1.0)
 
+    # Buttons the bot must never press (they lead to Treasure / Sprites / Shop pages)
+    FORBIDDEN = {"EQUIP", "SPRITE", "SPRITES", "TREASURE", "SHOP", "LOCKER", "BUY", "PURCHASE",
+                 "GIFT", "QUESTS", "PASSES", "CAREER", "COMPETE", "UNEQUIP", "CUSTOMIZE"}
+
+    def is_forbidden(self, x, y, ws=None, rx=None, ry=None):
+        """True if the spot (x, y) is on a button whose text is an Equip / Sprite / Treasure ... button."""
+        ws = self.scan_words() if ws is None else ws
+        _, _, w, h = self.rect()
+        rx = rx or w * 0.09
+        ry = ry or h * 0.035
+        near = [t["t"] for t in ws if abs(t["cx"] - x) < rx and abs(t["cy"] - y) < ry]
+        bad = set(near) & self.FORBIDDEN
+        if bad:
+            self.log(f"Not clicking at ({int(x)}, {int(y)}): that is the {' '.join(sorted(bad)).title()} button.")
+        return bool(bad)
+
+    def back_to_play(self, ws=None):
+        """Get back to the main Play screen (e.g. after ending up on Treasure / Sprites)."""
+        ws = self.scan_words() if ws is None else ws
+        tabs = [w for w in ws if w["t"] == "PLAY" and w["fy"] < 0.12]
+        if tabs:
+            self.log("Not on the Play screen - clicking the PLAY tab.")
+            self.click_abs(tabs[0]["cx"], tabs[0]["cy"])
+        else:
+            self.log("Not on the Play screen - pressing Esc.")
+            focus(self.hwnd)
+            tap("esc")
+        self.sleep(3)
+
     def press_play(self, label="PLAY"):
+        """Click the yellow PLAY button. Never clicks blind: off the Play screen it goes back first."""
         boxes = self.yellow_buttons()
         if boxes:
             b = boxes[0]
             cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
-            self.log(f"Clicking {label} (yellow button) at ({int(cx)}, {int(cy)}).")
-            self.click_abs(cx, cy)
-            return b
-        self.click_text(["PLAY"], label, fallback="play", min_fy=0.12)
+            if not self.is_forbidden(cx, cy, rx=(b[2] - b[0]) / 2, ry=(b[3] - b[1]) / 2 + 4):
+                self.log(f"Clicking {label} (yellow button) at ({int(cx)}, {int(cy)}).")
+                self.click_abs(cx, cy)
+                return b
+        self.back_to_play()
         return None
 
     def queued(self, ws):
         t = {w["t"] for w in ws}
+        if t & {"EQUIP", "SPRITES"}:
+            return False                       # on the Treasure / Sprites page, not matchmaking
         if t & {"CANCEL", "SEARCHING", "QUEUE", "QUEUED", "LOADING", "CONNECTING"}:
             return True
         return not self.yellow_buttons() and not self.panel_open(ws)[0]
@@ -1423,12 +1463,14 @@ class Bot:
             x, y = hit["cx"], hit["cy"]
         else:
             boxes = self.yellow_buttons()
-            if boxes:                              # 193 px above PLAY when PLAY is 328 px wide
-                b = boxes[0]
-                u = (b[2] - b[0]) / 328.0
-                x, y = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2 - 193 * u
-            else:
-                x, y = self.abs_point("mode")
+            if not boxes:
+                self.log("Mode button: not on the Play screen.")
+                return False
+            b = boxes[0]                           # 193 px above PLAY when PLAY is 328 px wide
+            u = (b[2] - b[0]) / 328.0
+            x, y = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2 - 193 * u
+        if self.is_forbidden(x, y):
+            return False
         self.log(f"Opening the mode panel at ({int(x)}, {int(y)}).")
         self.click_abs(x, y)
         self.sleep(2.0)
@@ -1582,26 +1624,32 @@ class Bot:
                 last_banner = time.time()
                 keys = [k.strip().upper() for k in self.s.get("text", "banner_words").split(",") if k.strip()]
 
-                def is_find(words):
-                    return any(k in t_ for k in keys for t_ in words) or \
-                        any(t_.startswith("FOUN") or "GIZM" in t_ for t_ in words)
+                def you_found(words):
+                    """The 'YOU FOUND <item>' banner. Returns the item name or None."""
+                    fi = next((i for i, t_ in enumerate(words) if t_.startswith("FOUN") or t_.endswith("OUND")), None)
+                    if fi is None:
+                        return None
+                    has_you = any(t_ in ("YOU", "YOUR") or t_.startswith("YO") for t_ in words[:fi + 1])
+                    if not has_you and not (words[fi] == "FOUND" and fi + 1 < len(words)):
+                        return None                     # "YOU" misread: still need a clean FOUND <item>
+                    name = re.sub(r"[^A-Z ]", " ", " ".join(words[fi + 1:]))
+                    name = re.sub(r"(?<=[A-Z])(GIZMO)", r" \1", name)      # SPRITEGIZMO -> SPRITE GIZMO
+                    name = " ".join(x for x in name.split() if len(x) > 2).title()
+                    return name or "Item"
 
-                bt = []
+                item = None
                 for inv in (False, True):
-                    bt = [w["t"] for w in self.scan_words("banner", inv)]
-                    if is_find(bt):
+                    item = you_found([w["t"] for w in self.scan_words("banner", inv)])
+                    if item:
                         break
-                if is_find(bt):
-                    after = bt[bt.index("FOUND") + 1:] if "FOUND" in bt else []
-                    name = " ".join(t_ for t_ in after if len(t_) > 2).title() or "Gizmo"
-                    self.stats["gizmos"] += 1
+                if item:
+                    if "Gizmo" in item:
+                        self.stats["gizmos"] += 1
+                    self.stats["found"] += 1
                     self.push_stats()
-                    self.log(f"Found: {name}")
-                    self.discord(f"Found {name}!", self.s.bool("discord", "shot_on_find"))
+                    self.log(f"You found: {item}")
+                    self.discord(f"You found {item}!", self.s.bool("discord", "shot_on_find"))
                     self.sleep(6)
-                if time.time() - getattr(self, "_last_claim_scan", 0) > 12:
-                    self._last_claim_scan = time.time()
-                    self.claim_rewards()
                 feed = ocr_text(self.zone_img("feed")).lower()
                 if self.s.bool("main", "reboot_thanks") and \
                         any(w.strip() and w.strip() in feed
