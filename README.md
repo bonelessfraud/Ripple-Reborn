@@ -6,7 +6,7 @@
 
 **Before you start:** set Fortnite to **Windowed Fullscreen** (Settings → Video → Window Mode) at **1920×1080** or **1920×1200**. Plain *Fullscreen* gives screen captures a black picture, and then the bot sees nothing.
 
-## ⭐ What it does, in one line
+## What it does, in one line
 
 Queues Battle Royale on its own, drops, plays like an idle human, claims your rewards, posts every **YOU FOUND** item to Discord, and leaves the match when the time, the players left or your team says so. Then it does it again.
 
