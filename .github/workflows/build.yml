@@ -16,9 +16,12 @@ jobs:
         shell: pwsh
         run: |
           pip install -r requirements.txt
+          python -c "import re,os; v=re.search(r'(?m)^VERSION = .([0-9.]+).', open('ripple_reborn.py', encoding='utf-8').read()).group(1); open(os.environ['GITHUB_ENV'], 'a').write('VERSION=' + v + chr(10))"
           pyinstaller --onefile --noconsole --name RippleReborn --icon logo.ico --add-data "logo.png;." --add-data "logo.ico;." --collect-all winrt.runtime --collect-all winrt.windows.media.ocr --collect-all winrt.windows.graphics.imaging --collect-all winrt.windows.storage.streams --collect-all winrt.windows.foundation --collect-all winrt.windows.globalization ripple_reborn.py
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0-${{ github.run_number }}
-          name: Ripple Reborn v1.0 (build ${{ github.run_number }})
+          tag_name: v${{ env.VERSION }}
+          name: Ripple Reborn v${{ env.VERSION }}
           files: dist/RippleReborn.exe
+          overwrite_files: true
+          make_latest: true

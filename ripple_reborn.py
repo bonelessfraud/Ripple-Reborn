@@ -42,8 +42,7 @@ try:
 except ImportError:  # pragma: no cover
     requests = None
 
-VERSION = "1.0"
-BUILD = "2026-11-15 #8"     # shown in the app, so you can tell which build is running
+VERSION = "1.1"     # +0.1 for every published update; the GitHub release is named after it
 APP = "RippleReborn"
 IS_WIN = sys.platform == "win32"
 
@@ -2344,7 +2343,7 @@ class App:
         dark_titlebar(self.root)
         self.log("Script ready. Set Fortnite to Windowed Fullscreen (1920x1080 or 1920x1200), "
                  "then press Start or Ctrl+Alt+1.")
-        self.log(f"Build {BUILD}")
+        self.log(f"Ripple Reborn v{VERSION}")
         self.log(f"Data folder (settings, log, debug): {DATA_DIR}")
         self.log(f"Settings file: {SETTINGS_FILE}  ({'loaded' if self.s.loaded else 'new'})")
         if not ocr_ready():
@@ -2368,7 +2367,7 @@ class App:
         left = tk.Frame(top, bg=BG)
         left.pack(side="left")
         tk.Label(left, text="Ripple Reborn", bg=BG, fg=FG, font=("Segoe UI", 17, "bold")).pack(anchor="w")
-        tk.Label(left, text=f"v{VERSION}  ·  build {BUILD}", bg=BG, fg=DIM, font=FONT_S).pack(anchor="w")
+        tk.Label(left, text=f"v{VERSION}", bg=BG, fg=DIM, font=FONT_S).pack(anchor="w")
         right = tk.Frame(top, bg=BG)
         right.pack(side="right")
         self.start_btn = RoundBtn(right, "▶  Start", self.toggle_start, bg=ACCENT, fg="white",
