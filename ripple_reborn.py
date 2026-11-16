@@ -42,7 +42,7 @@ try:
 except ImportError:  # pragma: no cover
     requests = None
 
-VERSION = "1.1"     # +0.1 for every published update; the GitHub release is named after it
+VERSION = "1.2"     # +0.1 for every published update; the GitHub release is named after it
 APP = "RippleReborn"
 IS_WIN = sys.platform == "win32"
 
@@ -67,14 +67,14 @@ POINTS = {
     "claim": (0.580, 0.912),         # CLAIM / CLAIM ALL on reward screens (fallback)
 }
 ZONES = {
-    "players": (0.905, 0.030, 0.985, 0.075),   # players-left counter
+    "players": (0.812, 0.093, 0.845, 0.124),   # players-left number (next to the person icon, left of the map)
     "lobby": (0.000, 0.000, 1.000, 0.120),     # top menu bar (PLAY SHOP LOCKER ...)
     "results": (0.300, 0.050, 0.700, 0.200),   # results / victory header
     "banner": (0.380, 0.080, 0.620, 0.320),    # "YOU FOUND ... GIZMO" banner
     "feed": (0.010, 0.420, 0.320, 0.650),      # elimination / reboot feed
     "team": (0.000, 0.700, 0.160, 0.860),      # teammate names + health bars (bottom left)
 }
-POINTS_VERSION = "6"
+POINTS_VERSION = "7"
 # Fortnite pins HUD pieces to the top, bottom or middle of the screen. Positions are stored
 # for a 16:9 picture and mapped onto taller screens (16:10) from that anchor.
 ANCHOR = {"play": "bottom", "mode": "bottom", "menu_tab": "top", "leave_menu": "top",
