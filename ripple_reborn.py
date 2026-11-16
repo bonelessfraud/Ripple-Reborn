@@ -16,6 +16,7 @@ banned. Use at your own risk, preferably on an account you can afford to lose.
 import configparser
 import ctypes
 import io
+import math
 import os
 import queue
 import random
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover
     requests = None
 
 VERSION = "1.0"
+BUILD = "2026-11-15 #8"     # shown in the app, so you can tell which build is running
 APP = "RippleReborn"
 IS_WIN = sys.platform == "win32"
 
@@ -121,9 +123,10 @@ DEFAULTS = {
     },
     "options": {
         "ocr_lobby": "1", "debug_shots": "0", "always_on_top": "1", "set_quads": "1",
-        "pickaxe_key": "1", "gun_key": "2", "look_up": "150",
+        "pickaxe_key": "1", "gun_key": "2", "look_up": "150", "sprint_key": "shift",
+        "color": "#7c2cf0",
     },
-    "discord": {"webhook": "", "shot_on_find": "1"},
+    "discord": {"webhook": "", "shot_on_find": "1", "summary": "1"},
     "text": {
         "afk1": "brb, afk for a minute", "afk2": "still afk, back soon",
         "thanks": "ty for the reboot!",
@@ -191,6 +194,40 @@ DIM = "#6f6a8a"
 ACCENT = "#7c2cf0"
 ACCENT_HI = "#9448ff"
 PINK = "#d010e0"
+COLOR_PRESETS = {"Purple": "#7c2cf0", "Blue": "#2f6bff", "Cyan": "#00a6c8", "Green": "#1fa85a",
+                 "Orange": "#f06a14", "Red": "#e0304d", "Pink": "#e0359a", "Gold": "#c9970e"}
+THEMED = []          # repaint callbacks for widgets that use the accent colour
+
+
+def _shade(hexc, f):
+    """Lighten (f > 0) or darken (f < 0) a #rrggbb colour."""
+    r, g, b = (int(hexc[i:i + 2], 16) for i in (1, 3, 5))
+    if f >= 0:
+        r, g, b = (int(c + (255 - c) * f) for c in (r, g, b))
+    else:
+        r, g, b = (int(c * (1 + f)) for c in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def valid_hex(text):
+    text = text.strip()
+    if not text.startswith("#"):
+        text = "#" + text
+    return text.lower() if re.fullmatch(r"#[0-9a-fA-F]{6}", text) else None
+
+
+def set_theme(hexc):
+    """Change the accent colour everywhere (buttons, switches, checkboxes, tab underline)."""
+    global ACCENT, ACCENT_HI, PINK
+    hexc = valid_hex(hexc or "") or "#7c2cf0"
+    ACCENT = hexc
+    ACCENT_HI = _shade(hexc, 0.18)
+    PINK = "#d010e0" if hexc == "#7c2cf0" else _shade(hexc, 0.28)
+    for fn in list(THEMED):
+        try:
+            fn()
+        except Exception:
+            THEMED.remove(fn)                # widget was closed
 OFF = "#26223a"
 GOOD = "#6fe08a"
 BAD = "#ff6b6b"
@@ -313,7 +350,8 @@ SCAN = {
     "t": 0x14, "y": 0x15, "u": 0x16, "i": 0x17, "o": 0x18, "p": 0x19, "enter": 0x1C,
     "ctrl": 0x1D, "a": 0x1E, "s": 0x1F, "d": 0x20, "f": 0x21, "g": 0x22, "h": 0x23, "j": 0x24,
     "k": 0x25, "l": 0x26, "shift": 0x2A, "z": 0x2C, "x": 0x2D, "c": 0x2E, "v": 0x2F, "b": 0x30,
-    "n": 0x31, "m": 0x32, "space": 0x39, "f1": 0x3B, "f2": 0x3C, "f3": 0x3D, "f4": 0x3E,
+    "n": 0x31, "m": 0x32, "space": 0x39, "lshift": 0x2A, "rshift": 0x36, "alt": 0x38,
+    "capslock": 0x3A, "caps": 0x3A, "lctrl": 0x1D, "f1": 0x3B, "f2": 0x3C, "f3": 0x3D, "f4": 0x3E,
     "f5": 0x3F, "f6": 0x40, "f7": 0x41, "f8": 0x42, "f9": 0x43, "f10": 0x44, "f11": 0x57,
     "f12": 0x58,
 }
@@ -377,6 +415,20 @@ def click(x, y):
     move_abs(x, y)
     time.sleep(0.25)
     mouse_button(0x0002, 0x0004, hold=0.10)
+
+
+def smooth_look(dx, dy, duration=0.6):
+    """Camera turn that speeds up and slows down like a hand on a mouse."""
+    steps = max(8, int(duration / 0.012))
+    done_x = done_y = 0
+    for i in range(1, steps + 1):
+        p = (1 - math.cos(math.pi * i / steps)) / 2
+        tx, ty = int(round(dx * p)), int(round(dy * p))
+        inp = INPUT(type=0)
+        inp.u.mi = MOUSEINPUT(tx - done_x, ty - done_y, 0, 0x0001, 0, 0)
+        _send(inp)
+        done_x, done_y = tx, ty
+        time.sleep(duration / steps)
 
 
 def mouse_move_rel(dx, dy, steps=12, total_time=0.25):
@@ -746,14 +798,39 @@ class Bot:
         self.paused = False
         self.running = True
         self.stats.update(matches=0, found=0, recoveries=0, gizmos=0, players=None,
-                          start=time.time(), paused_total=0.0)
+                          start=time.time(), paused_total=0.0, items=[])
+        self._summary_sent = False
+        self._stop_reason = "Stopped"
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         self.q.put(("state", "RUNNING"))
 
-    def stop(self):
+    def stop(self, reason="Stopped"):
+        if self.running and not self.stop_flag.is_set():
+            self._stop_reason = reason
         self.stop_flag.set()
         self.paused = False
+
+    def send_summary(self):
+        """Post a session summary to Discord (once per session)."""
+        if getattr(self, "_summary_sent", True) or not self.s.bool("discord", "summary"):
+            return
+        if not valid_webhook(self.s.get("discord", "webhook")):
+            return
+        self._summary_sent = True
+        sec = self.afk_seconds()
+        st = self.stats
+        counts = {}
+        for it in st.get("items", []):
+            counts[it] = counts.get(it, 0) + 1
+        items = ", ".join(f"{k} x{v}" if v > 1 else k for k, v in counts.items()) or "none"
+        text = (f"**Ripple Reborn - session ended** ({getattr(self, '_stop_reason', 'Stopped')})\n"
+                f"Time AFK: {sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}\n"
+                f"Matches: {st['matches']}  |  Gizmos: {st['gizmos']}  |  Found: {st['found']}  |  "
+                f"Recoveries: {st['recoveries']}\n"
+                f"Items: {items}")
+        if self.discord(text):
+            self.log("Session summary sent to Discord.")
 
     def toggle_pause(self):
         if not self.running:
@@ -976,31 +1053,77 @@ class Bot:
                 self.click_abs(hit["cx"], hit["cy"])
 
     def move_once(self):
-        pick, gun = self.s.get("options", "pickaxe_key"), self.s.get("options", "gun_key")
+        """One random 'human' action: walk/sprint with hops, smooth turn, glance, short stop..."""
+        pick, gun = self.s.get("options", "pickaxe_key").strip(), self.s.get("options", "gun_key").strip()
         r = random.random()
-        if r < 0.40:
-            k = random.choice(["w", "w", "a", "d", "s"])
-            key_event(k, True)
-            self.sleep(random.uniform(0.4, 2.0))
-            key_event(k, False)
-        elif r < 0.65:
-            mouse_move_rel(random.randint(-400, 400), random.randint(-40, 40))
-        elif r < 0.80:
+        if r < 0.45:
+            self.walk()
+        elif r < 0.60:                                   # smooth turn
+            smooth_look(random.choice([-1, 1]) * random.randint(150, 650), random.randint(-30, 30),
+                        random.uniform(0.45, 1.1))
+        elif r < 0.72:                                   # quick glance and back
+            dx = random.choice([-1, 1]) * random.randint(90, 260)
+            smooth_look(dx, random.randint(-15, 15), random.uniform(0.2, 0.35))
+            self.sleep(random.uniform(0.3, 0.9))
+            smooth_look(-dx, 0, random.uniform(0.25, 0.45))
+        elif r < 0.84:                                   # short stop, maybe looking around a bit
+            end = time.time() + random.uniform(0.6, 2.5)
+            while time.time() < end:
+                if random.random() < 0.3:
+                    smooth_look(random.randint(-60, 60), random.randint(-8, 8), 0.3)
+                self.sleep(0.3)
+        elif r < 0.88:
             tap("space")
-        elif r < 0.90 and pick:
+        elif r < 0.95 and pick:
             tap(pick)
             self.sleep(0.3)
-            mouse_button(0x0002, 0x0004, hold=0.3)  # swing
+            mouse_button(0x0002, 0x0004, hold=0.3)       # swing
         elif gun:
             tap(gun)
             self.sleep(0.3)
             mouse_button(0x0002, 0x0004, hold=0.2)
-        else:
-            return
-        self.sleep(random.uniform(0.3, 1.5))
+        self.sleep(random.uniform(0.15, 0.6))
+
+    def walk(self):
+        """Walk forward 1.5-5 s: sprinting most of the time, sometimes slowing down, hopping
+        over small rocks, drifting the camera a little and now and then strafing."""
+        sprint = self.s.get("options", "sprint_key").strip().lower()
+        sprint = sprint if sprint in SCAN else ""
+        strafe = random.choice(["a", "d"]) if random.random() < 0.3 else None
+        sprinting = bool(sprint) and random.random() < 0.8
+        held = ["w"] + ([strafe] if strafe else [])
+        for k in held:
+            key_event(k, True)
+        if sprinting:
+            key_event(sprint, True)
+        end = time.time() + random.uniform(1.5, 5.0)
+        next_jump = time.time() + random.uniform(0.4, 1.2)
+        try:
+            while time.time() < end:
+                if self.paused or self.stop_flag.is_set():
+                    break
+                now = time.time()
+                if now >= next_jump:                      # hop: gets over rocks and small walls
+                    if random.random() < 0.65:
+                        tap("space")
+                    next_jump = now + random.uniform(0.5, 1.5)
+                if sprint and random.random() < 0.035:   # slow down / speed back up
+                    sprinting = not sprinting
+                    key_event(sprint, sprinting)
+                if strafe and random.random() < 0.05:    # stop strafing
+                    key_event(strafe, False)
+                    strafe = None
+                if random.random() < 0.3:                 # small camera drift while running
+                    mouse_move_rel(random.randint(-22, 22), random.randint(-3, 3), steps=4, total_time=0.08)
+                time.sleep(0.1)
+        finally:
+            for k in ["w", "a", "d"] + ([sprint] if sprint else []):
+                key_event(k, False)
+        self.check()
 
     def release_all(self):
-        for k in ("w", "a", "s", "d", "shift", "ctrl", "space"):
+        sprint = self.s.get("options", "sprint_key").strip().lower()
+        for k in {"w", "a", "s", "d", "shift", "ctrl", "space", sprint} - {""}:
             try:
                 key_event(k, False)
             except Exception:
@@ -1021,8 +1144,13 @@ class Bot:
             self.log("Stopped.")
         except Exception as e:  # keep the real reason in the feed
             self.log(f"ERROR: {e}")
+            self._stop_reason = f"error: {e}"
         finally:
             self.release_all()
+            try:
+                self.send_summary()
+            except Exception as e:
+                self.log(f"Summary error: {e}")
             self.running = False
             self.paused = False
             self.status("Stopped", "Ready. Press Start or Ctrl+Alt+1.")
@@ -1055,7 +1183,8 @@ class Bot:
                     self.log("Results screen - Play again.")
                     self.click_abs(hit["cx"], hit["cy"])
                     self.sleep(3)
-            if self.claim_rewards():
+            ws = self.scan_words()
+            if self.skip_survey(ws) or self.claim_rewards(ws):
                 continue
             lobby = self.in_lobby()
             if lobby is None:  # OCR detection disabled: just give the game time
@@ -1068,36 +1197,87 @@ class Bot:
                 t0 = time.time()
             self.sleep(2)
 
-    def claim_rewards(self, ws=None):
-        """Reward screens ('PIRATE SHOP ACCESS UNLOCKED!' / 'ITEM ACQUIRED'): press CLAIM."""
+    SURVEY_WORDS = {"HEAR", "SURVEY", "SURVEYS", "FEEDBACK", "RATING", "SATISFIED", "DISSATISFIED", "QUESTION"}
+
+    def skip_survey(self, ws=None):
+        """'WE WANT TO HEAR FROM YOU!' feedback surveys: press SKIP."""
         ws = self.scan_words() if ws is None else ws
-        claims = [w for w in ws if w["t"] == "CLAIM"]
-        if not claims:
-            ws2 = self.scan_words(inv=True)
-            claims = [w for w in ws2 if w["t"] == "CLAIM"]
-            ws = ws2 if claims else ws
         t = {w["t"] for w in ws}
-        if not claims:
-            if not t & {"ACQUIRED", "UNLOCKED"}:
-                return False
-            # reward screen, but the pale button text was not readable: use its usual spot
-            px, py = self.abs_point("claim")
-            claims = [dict(t="CLAIM", raw="CLAIM", cx=px, cy=py, h=20, fx=0.58, fy=0.91)]
-        # the button is the lowest CLAIM on screen (the description text also says "claim")
-        btn = max(claims, key=lambda w: w["cy"])
+        if len(t & self.SURVEY_WORDS) < 2:
+            return False
+        skips = [w for w in ws if w["t"] == "SKIP" and w["fy"] > 0.5]
+        if not skips:
+            ws2 = self.scan_words(inv=True)          # dark text on the white button
+            skips = [w for w in ws2 if w["t"] == "SKIP" and w["fy"] > 0.5]
+        if skips:
+            x, y = skips[0]["cx"], skips[0]["cy"]
+        else:                                          # where SKIP sits (centred pop-up)
+            x0, y0, W, H = self.rect()
+            px, py = frac_to_px(0.442, 0.807, "center", W, H)
+            x, y = x0 + px, y0 + py
+        self.log(f"Feedback survey - clicking SKIP at ({int(x)}, {int(y)}).")
+        self.click_abs(x, y)
+        self.sleep(2.0)
+        return True
+
+    REWARD_WORDS = {"ACQUIRED", "UNLOCKED", "FOUND", "REWARD", "REWARDS", "TREASURE", "CONGRATULATIONS"}
+
+    def claim_rewards(self, ws=None):
+        """Reward pop-ups in the lobby: 'TREASURE FOUND!', 'ITEM ACQUIRED', 'PIRATE SHOP ACCESS
+        UNLOCKED!' ... Presses the CLAIM / CLAIM ALL button at the bottom."""
+        def look(words):
+            t = {w["t"] for w in words}
+            # reward pop-ups put CLAIM / CLAIM ALL low and near the middle of the screen
+            btns = [w for w in words if w["t"] == "CLAIM" and w["fy"] > 0.75 and 0.3 < w["fx"] < 0.75]
+            return t, btns
+
+        ws = self.scan_words() if ws is None else ws
+        t, btns = look(ws)
+        if not btns:
+            ws2 = self.scan_words(inv=True)     # dark text on the pale button reads better inverted
+            t2, btns2 = look(ws2)
+            if btns2:
+                ws, btns = ws2, btns2
+            t |= t2
+        found_word = any(x.startswith("FOUN") for x in t)
+        title = ("ACQUIRED" in t or "UNLOCKED" in t or ("TREASURE" in t and found_word)
+                 or t & {"REWARD", "REWARDS", "CONGRATULATIONS"})
+        top = {w["t"] for w in ws if w["fy"] < 0.12}             # the lobby's tab bar is at the very top
+        menu_bar = len(top & {"SHOP", "LOCKER", "PASSES", "QUESTS", "CAREER", "COMPETE", "V-BUCKS"}) >= 2
+        if menu_bar or t & {"SPRITES", "VICTORY", "SPAWNED"}:
+            return False                       # lobby / Treasure page / match screens, not a pop-up
+        if not btns and not title:
+            return False
+        if btns:
+            w = max(btns, key=lambda w: w["cy"])
+            bx, by = w["cx"], w["cy"]
+        elif title:
+            # reward screen, button text not readable: use where the button sits
+            _, _, W, H = self.rect()
+            x0, y0 = self.rect()[:2]
+            fx = 0.587 if "ACQUIRED" in t else 0.5     # ITEM ACQUIRED has EQUIP + CLAIM; others one centred button
+            px, py = frac_to_px(fx, 0.914, "bottom", W, H)
+            bx, by = x0 + px, y0 + py
+        else:
+            return False
+        if self.is_forbidden(bx, by, ws, rx=40, ry=12):
+            return False
         if time.time() - getattr(self, "_last_claim", 0) > 10:
             if t & {"PIRATE", "ACCESS"}:
                 what = "Pirate Shop Access"
+            elif "TREASURE" in t and found_word:
+                what = "Treasure Found"
+            elif "ACQUIRED" in t:
+                what = "Item Acquired"
             else:
-                big = sorted((w for w in ws if w["h"] > btn["h"] * 1.4 and w["t"] not in ("ITEM", "ACQUIRED")),
-                             key=lambda w: (round(w["cy"] / 20), w["cx"]))
-                what = " ".join(w["raw"] for w in big[:5]) or "an item"
+                what = "Reward"
             self.stats["found"] += 1
             self.push_stats()
             self.log(f"Reward screen: {what} - claiming.")
+            self.stats.setdefault("items", []).append(what)
             self.discord(f"Claimed: {what}", self.s.bool("discord", "shot_on_find"))
         self._last_claim = time.time()
-        self.click_abs(btn["cx"], btn["cy"])
+        self.click_abs(bx, by)
         self.sleep(2.5)
         return True
 
@@ -1398,19 +1578,52 @@ class Bot:
         self.click_abs(ix, iy)
         self.sleep(1.0)
 
+    # Buttons the bot must never press (they lead to Treasure / Sprites / Shop pages)
+    FORBIDDEN = {"EQUIP", "SPRITE", "SPRITES", "TREASURE", "SHOP", "LOCKER", "BUY", "PURCHASE",
+                 "GIFT", "QUESTS", "PASSES", "CAREER", "COMPETE", "UNEQUIP", "CUSTOMIZE"}
+
+    def is_forbidden(self, x, y, ws=None, rx=None, ry=None):
+        """True if the spot (x, y) is on a button whose text is an Equip / Sprite / Treasure ... button."""
+        ws = self.scan_words() if ws is None else ws
+        _, _, w, h = self.rect()
+        rx = rx or w * 0.09
+        ry = ry or h * 0.035
+        near = [t["t"] for t in ws if abs(t["cx"] - x) < rx and abs(t["cy"] - y) < ry]
+        bad = set(near) & self.FORBIDDEN
+        if bad:
+            self.log(f"Not clicking at ({int(x)}, {int(y)}): that is the {' '.join(sorted(bad)).title()} button.")
+        return bool(bad)
+
+    def back_to_play(self, ws=None):
+        """Get back to the main Play screen (e.g. after ending up on Treasure / Sprites)."""
+        ws = self.scan_words() if ws is None else ws
+        tabs = [w for w in ws if w["t"] == "PLAY" and w["fy"] < 0.12]
+        if tabs:
+            self.log("Not on the Play screen - clicking the PLAY tab.")
+            self.click_abs(tabs[0]["cx"], tabs[0]["cy"])
+        else:
+            self.log("Not on the Play screen - pressing Esc.")
+            focus(self.hwnd)
+            tap("esc")
+        self.sleep(3)
+
     def press_play(self, label="PLAY"):
+        """Click the yellow PLAY button. Never clicks blind: off the Play screen it goes back first."""
         boxes = self.yellow_buttons()
         if boxes:
             b = boxes[0]
             cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
-            self.log(f"Clicking {label} (yellow button) at ({int(cx)}, {int(cy)}).")
-            self.click_abs(cx, cy)
-            return b
-        self.click_text(["PLAY"], label, fallback="play", min_fy=0.12)
+            if not self.is_forbidden(cx, cy, rx=(b[2] - b[0]) / 2, ry=(b[3] - b[1]) / 2 + 4):
+                self.log(f"Clicking {label} (yellow button) at ({int(cx)}, {int(cy)}).")
+                self.click_abs(cx, cy)
+                return b
+        self.back_to_play()
         return None
 
     def queued(self, ws):
         t = {w["t"] for w in ws}
+        if t & {"EQUIP", "SPRITES"}:
+            return False                       # on the Treasure / Sprites page, not matchmaking
         if t & {"CANCEL", "SEARCHING", "QUEUE", "QUEUED", "LOADING", "CONNECTING"}:
             return True
         return not self.yellow_buttons() and not self.panel_open(ws)[0]
@@ -1423,12 +1636,14 @@ class Bot:
             x, y = hit["cx"], hit["cy"]
         else:
             boxes = self.yellow_buttons()
-            if boxes:                              # 193 px above PLAY when PLAY is 328 px wide
-                b = boxes[0]
-                u = (b[2] - b[0]) / 328.0
-                x, y = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2 - 193 * u
-            else:
-                x, y = self.abs_point("mode")
+            if not boxes:
+                self.log("Mode button: not on the Play screen.")
+                return False
+            b = boxes[0]                           # 193 px above PLAY when PLAY is 328 px wide
+            u = (b[2] - b[0]) / 328.0
+            x, y = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2 - 193 * u
+        if self.is_forbidden(x, y):
+            return False
         self.log(f"Opening the mode panel at ({int(x)}, {int(y)}).")
         self.click_abs(x, y)
         self.sleep(2.0)
@@ -1458,6 +1673,8 @@ class Bot:
                 self.press_play("PLAY in the mode panel")
                 self.sleep(3)
                 ws = self.scan_words()
+            if self.skip_survey(ws) or self.claim_rewards(ws):
+                continue                       # a pop-up covered the lobby - try again
             if self.queued(ws):
                 return True
             self.log(f"PLAY attempt {attempt}: not in matchmaking yet. Saw: {self.words_summary(ws)}")
@@ -1474,8 +1691,10 @@ class Bot:
         self.wait_lobby()
         self.status("In lobby", "Settling...")
         self.sleep(self.s.int("match", "lobby_settle"))
-        while self.claim_rewards():
-            pass
+        for _ in range(5):                    # pop-ups can come one after another
+            ws = self.scan_words()
+            if not (self.skip_survey(ws) or self.claim_rewards(ws)):
+                break
         self.queue_game()
         self.stats["matches"] += 1
         self.push_stats()
@@ -1582,26 +1801,33 @@ class Bot:
                 last_banner = time.time()
                 keys = [k.strip().upper() for k in self.s.get("text", "banner_words").split(",") if k.strip()]
 
-                def is_find(words):
-                    return any(k in t_ for k in keys for t_ in words) or \
-                        any(t_.startswith("FOUN") or "GIZM" in t_ for t_ in words)
+                def you_found(words):
+                    """The 'YOU FOUND <item>' banner. Returns the item name or None."""
+                    fi = next((i for i, t_ in enumerate(words) if t_.startswith("FOUN") or t_.endswith("OUND")), None)
+                    if fi is None:
+                        return None
+                    has_you = any(t_ in ("YOU", "YOUR") or t_.startswith("YO") for t_ in words[:fi + 1])
+                    if not has_you and not (words[fi] == "FOUND" and fi + 1 < len(words)):
+                        return None                     # "YOU" misread: still need a clean FOUND <item>
+                    name = re.sub(r"[^A-Z ]", " ", " ".join(words[fi + 1:]))
+                    name = re.sub(r"(?<=[A-Z])(GIZMO)", r" \1", name)      # SPRITEGIZMO -> SPRITE GIZMO
+                    name = " ".join(x for x in name.split() if len(x) > 2).title()
+                    return name or "Item"
 
-                bt = []
+                item = None
                 for inv in (False, True):
-                    bt = [w["t"] for w in self.scan_words("banner", inv)]
-                    if is_find(bt):
+                    item = you_found([w["t"] for w in self.scan_words("banner", inv)])
+                    if item:
                         break
-                if is_find(bt):
-                    after = bt[bt.index("FOUND") + 1:] if "FOUND" in bt else []
-                    name = " ".join(t_ for t_ in after if len(t_) > 2).title() or "Gizmo"
-                    self.stats["gizmos"] += 1
+                if item:
+                    if "Gizmo" in item:
+                        self.stats["gizmos"] += 1
+                    self.stats["found"] += 1
                     self.push_stats()
-                    self.log(f"Found: {name}")
-                    self.discord(f"Found {name}!", self.s.bool("discord", "shot_on_find"))
+                    self.log(f"You found: {item}")
+                    self.stats.setdefault("items", []).append(item)
+                    self.discord(f"You found {item}!", self.s.bool("discord", "shot_on_find"))
                     self.sleep(6)
-                if time.time() - getattr(self, "_last_claim_scan", 0) > 12:
-                    self._last_claim_scan = time.time()
-                    self.claim_rewards()
                 feed = ocr_text(self.zone_img("feed")).lower()
                 if self.s.bool("main", "reboot_thanks") and \
                         any(w.strip() and w.strip() in feed
@@ -1746,6 +1972,7 @@ class Toggle(tk.Canvas):
         self.bind("<Button-1>", self._flip)
         var.trace_add("write", lambda *_: self._paint())
         self._paint()
+        THEMED.append(self._paint)
 
     def _flip(self, _=None):
         self.var.set(not self.var.get())
@@ -1773,6 +2000,7 @@ class Check(tk.Frame):
             w.bind("<Button-1>", lambda _: var.set(not var.get()))
         var.trace_add("write", lambda *_: self._paint())
         self._paint()
+        THEMED.append(self._paint)
 
     def _paint(self):
         on = self.var.get()
@@ -1855,10 +2083,12 @@ class SettingsWindow(tk.Toplevel):
             self.update_idletasks()
             mw, mh = max(mw, self.winfo_reqwidth()), max(mh, self.winfo_reqheight())
         self.select("Match")
+        THEMED.append(lambda: self.select(self.cur_tab) if self.winfo_exists() else 1 / 0)
         self.geometry(f"{max(mw, S(700))}x{mh}")
         dark_titlebar(self)
 
     def select(self, name):
+        self.cur_tab = name
         for n, f in self.tabs.items():
             f.pack_forget()
             lbl, ul = self.tab_btns[n]
@@ -1915,14 +2145,16 @@ class SettingsWindow(tk.Toplevel):
         f.columnconfigure(1, weight=1)
         row = tk.Frame(f, bg=BG)
         row.grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 0))
-        for label, key in (("Pickaxe key", "pickaxe_key"), ("Gun key", "gun_key")):
+        for label, key in (("Pickaxe key", "pickaxe_key"), ("Gun key", "gun_key"),
+                           ("Sprint key", "sprint_key")):
             tk.Label(row, text=label, bg=BG, fg=FG, font=FONT).pack(side="left")
             var = tk.StringVar(value=self.s.get("options", key))
             var.trace_add("write", lambda *_, k=key, v=var: self.s.set("options", k, v.get().strip()))
             e = dark_entry(row, var, width=5)
             e.pack(side="left", padx=(12, 30), ipady=4)
-        tk.Label(f, text="Your slot keys for the random movement (e.g. 1, 2, q, F5). "
-                 "Gun empty = never shoot.", bg=BG, fg=DIM, font=FONT_S).grid(
+        tk.Label(f, text="Slot keys for the random movement (e.g. 1, 2, q, F5). Gun empty = never shoot. "
+                 "Sprint: shift, ctrl, alt, caps or a letter. Empty = walk only.",
+                 bg=BG, fg=DIM, font=FONT_S, wraplength=S(640), justify="left").grid(
             row=3, column=0, columnspan=2, sticky="w", padx=16, pady=4)
         row = tk.Frame(f, bg=BG)
         row.grid(row=4, column=0, columnspan=2, sticky="w", padx=16, pady=10)
@@ -1933,6 +2165,55 @@ class SettingsWindow(tk.Toplevel):
         var.trace_add("write", lambda *_: self.save_num("options", "look_up", var, 0, 2000))
         tk.Label(row, text="Raises the camera after landing. 0 = off. Higher = more.",
                  bg=BG, fg=DIM, font=FONT_S).pack(side="left", padx=10)
+        self.build_color(f, 5)
+
+    def build_color(self, f, grid_row):
+        """Interface colour: 8 presets or any HEX code."""
+        row = tk.Frame(f, bg=BG)
+        row.grid(row=grid_row, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 10))
+        tk.Label(row, text="Interface color", bg=BG, fg=FG, font=FONT).pack(side="left")
+        cur = valid_hex(self.s.get("options", "color")) or "#7c2cf0"
+        name = next((n for n, c in COLOR_PRESETS.items() if c == cur), "Custom")
+        preset = tk.StringVar(value=name)
+        cb = ttk.Combobox(row, textvariable=preset, values=list(COLOR_PRESETS) + ["Custom"],
+                          state="readonly", width=9)
+        cb.pack(side="left", padx=12)
+        tk.Label(row, text="HEX", bg=BG, fg=DIM, font=FONT_S).pack(side="left")
+        hexvar = tk.StringVar(value=cur)
+        dark_entry(row, hexvar, width=9).pack(side="left", padx=(6, 10), ipady=3)
+        swatch = tk.Canvas(row, width=S(26), height=S(26), bg=BG, highlightthickness=0)
+        swatch.pack(side="left")
+        state = tk.Label(row, bg=BG, fg=DIM, font=FONT_S)
+        state.pack(side="left", padx=10)
+
+        def paint_swatch(c):
+            swatch.delete("all")
+            round_rect(swatch, 1, 1, S(26) - 1, S(26) - 1, S(8), fill=c, outline="")
+
+        def apply(c):
+            self.s.set("options", "color", c)
+            set_theme(c)
+            paint_swatch(c)
+
+        def on_preset(_=None):
+            c = COLOR_PRESETS.get(preset.get())
+            if c:
+                hexvar.set(c)              # triggers on_hex
+
+        def on_hex(*_):
+            c = valid_hex(hexvar.get())
+            if not c:
+                state.config(text="type a colour like #ff8800", fg=BAD)
+                return
+            state.config(text="")
+            match = next((n for n, v in COLOR_PRESETS.items() if v == c), "Custom")
+            if preset.get() != match:
+                preset.set(match)
+            apply(c)
+
+        cb.bind("<<ComboboxSelected>>", on_preset)
+        hexvar.trace_add("write", on_hex)
+        paint_swatch(cur)
 
     def opt_changed(self, key, var):
         self.s.set("options", key, var.get())
@@ -1956,7 +2237,10 @@ class SettingsWindow(tk.Toplevel):
         self.hook_changed()
         var = tk.BooleanVar(value=self.s.bool("discord", "shot_on_find"))
         var.trace_add("write", lambda *_: self.s.set("discord", "shot_on_find", var.get()))
-        Check(f, "Screenshot when an item is found (banner)", var).pack(anchor="w", padx=16, pady=12)
+        Check(f, "Screenshot when an item is found (banner)", var).pack(anchor="w", padx=16, pady=(12, 4))
+        var2 = tk.BooleanVar(value=self.s.bool("discord", "summary"))
+        var2.trace_add("write", lambda *_: self.s.set("discord", "summary", var2.get()))
+        Check(f, "Send a session summary when the bot stops", var2).pack(anchor="w", padx=16, pady=(4, 12))
 
     def hook_changed(self):
         url = self.hook.get().strip()
@@ -2049,6 +2333,7 @@ class App:
         self.root.attributes("-topmost", self.s.bool("options", "always_on_top"))
         setup_style(self.root)
         set_icon(self.root)
+        set_theme(self.s.get("options", "color"))
         self.build()
         self.root.update_idletasks()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -2059,6 +2344,7 @@ class App:
         dark_titlebar(self.root)
         self.log("Script ready. Set Fortnite to Windowed Fullscreen (1920x1080 or 1920x1200), "
                  "then press Start or Ctrl+Alt+1.")
+        self.log(f"Build {BUILD}")
         self.log(f"Data folder (settings, log, debug): {DATA_DIR}")
         self.log(f"Settings file: {SETTINGS_FILE}  ({'loaded' if self.s.loaded else 'new'})")
         if not ocr_ready():
@@ -2082,12 +2368,13 @@ class App:
         left = tk.Frame(top, bg=BG)
         left.pack(side="left")
         tk.Label(left, text="Ripple Reborn", bg=BG, fg=FG, font=("Segoe UI", 17, "bold")).pack(anchor="w")
-        tk.Label(left, text=f"v{VERSION}  ·  personal build", bg=BG, fg=DIM, font=FONT_S).pack(anchor="w")
+        tk.Label(left, text=f"v{VERSION}  ·  build {BUILD}", bg=BG, fg=DIM, font=FONT_S).pack(anchor="w")
         right = tk.Frame(top, bg=BG)
         right.pack(side="right")
         self.start_btn = RoundBtn(right, "▶  Start", self.toggle_start, bg=ACCENT, fg="white",
                                   font=FONT_B, w=140, h=34, r=15)
         self.start_btn.pack()
+        THEMED.append(lambda: self.start_btn.config(bg=ACCENT))
         flat_button(right, "⚙  Settings", self.open_settings, w=140, h=30).pack(pady=(5, 0))
 
         hk = tk.Frame(r, bg=BG)
@@ -2119,6 +2406,7 @@ class App:
         self.t_players.grid(row=1, column=1, sticky="w", padx=(0, 28))
         self.t_gizmos = tk.Label(stats, text="0", bg=BG, fg=PINK, font=("Segoe UI", 19, "bold"))
         self.t_gizmos.grid(row=1, column=2, sticky="w")
+        THEMED.append(lambda: self.t_gizmos.config(fg=PINK))
         self.t_counts = tk.Label(stats, text="Matches 0  ·  found 0  ·  recoveries 0", bg=BG, fg=DIM,
                                  font=FONT_S)
         self.t_counts.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
@@ -2364,12 +2652,15 @@ class App:
         self.q.put(("call", fn))
 
     def kill(self):
-        self.bot.stop()
+        self.bot.stop("Killed with Ctrl+Alt+K")
         self.bot.release_all()
         self.root.after(200, self.quit)
 
     def quit(self):
-        self.bot.stop()
+        if self.bot.running:
+            self.bot.stop("Bot closed")
+            if self.bot.thread:
+                self.bot.thread.join(20)        # lets the session summary reach Discord
         self.root.destroy()
         os._exit(0)
 
