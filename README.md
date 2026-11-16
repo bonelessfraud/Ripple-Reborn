@@ -1,8 +1,6 @@
 # Ripple Reborn (v1.2): AFK Fortnite bot for gizmos, treasure and pirate tokens
 
-**Automating Fortnite breaks Epic's rules. Any account you run this on can be banned. Use an account you can afford to lose.**
-
-**Download:** the ready-to-run `RippleReborn.exe` is on the [latest release](../../releases/latest). No Python and no installs needed: text reading uses the OCR built into Windows 10/11.
+`RippleReborn.exe` is on the [latest release](../../releases/latest). No Python and no installs needed: text reading uses the OCR built into Windows 10/11.
 
 **Before you start:** set Fortnite to **Windowed Fullscreen** (Settings → Video → Window Mode) at **1920×1080** or **1920×1200**. Plain *Fullscreen* gives screen captures a black picture, and then the bot sees nothing.
 
