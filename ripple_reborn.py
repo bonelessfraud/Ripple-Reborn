@@ -42,7 +42,7 @@ try:
 except ImportError:  # pragma: no cover
     requests = None
 
-VERSION = "1.2"     # +0.1 for every published update; the GitHub release is named after it
+VERSION = "1.3"     # +0.1 for every published update; the GitHub release is named after it
 APP = "RippleReborn"
 IS_WIN = sys.platform == "win32"
 
@@ -125,7 +125,7 @@ DEFAULTS = {
         "pickaxe_key": "1", "gun_key": "2", "look_up": "150", "sprint_key": "shift",
         "color": "#7c2cf0",
     },
-    "discord": {"webhook": "", "shot_on_find": "1", "summary": "1"},
+    "discord": {"webhook": "", "shot_on_find": "1", "summary": "1", "status_shot": "0", "status_min": "30"},
     "text": {
         "afk1": "brb, afk for a minute", "afk2": "still afk, back soon",
         "thanks": "ty for the reboot!",
@@ -691,6 +691,94 @@ def find_yellow_buttons(img):
     return [b[1:] for b in boxes]
 
 
+# ---- fuzzy matching for stylised banner text (F0UND, CIZMO, GEMO, TR0VATO, UNL0CKED ...) ----
+_DIGIT_FIX = str.maketrans("0158|$", "OISBIS")
+
+
+def fix_ocr(t):
+    """Digits OCR often reads instead of letters: 0->O, 1->I, 5->S, 8->B."""
+    return t.upper().translate(_DIGIT_FIX)
+
+
+def lev(a, b):
+    """Edit distance (how many letters differ)."""
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def close_to(t, word, extra=0):
+    t = fix_ocr(t)
+    allowed = (1 if len(word) <= 5 else 2) + extra
+    return abs(len(t) - len(word)) <= allowed and lev(t, word) <= allowed
+
+
+# "FOUND" in the languages Fortnite ships (EN, IT, FR, DE, ES, PT, PL, TR)
+FOUND_WORDS = ("FOUND", "TROVATO", "TROUVE", "GEFUNDEN", "ENCONTRASTE", "ENCONTROU", "ENCONTRADO",
+               "ZNALAZLES", "BULDUN")
+YOU_WORDS = ("YOU", "HAI", "TU", "AS", "DU", "HAST", "VOCE", "HAS")
+
+
+def is_found_word(t):
+    t = fix_ocr(t)
+    return any(close_to(t, w) for w in FOUND_WORDS) or t.startswith("FOUN") or t.endswith("OUND")
+
+
+def is_gizmo_word(t):
+    t = fix_ocr(t)
+    if any(k in t for k in ("GIZM", "IZMO", "GIZ0", "GEMO", "CIZM")):
+        return True
+    return 4 <= len(t) <= 7 and lev(t, "GIZMO") <= 2
+
+
+def is_sprite_word(t):
+    t = fix_ocr(t)
+    return t.startswith("SPRIT") or t.startswith("SPRLT") or close_to(t, "SPRITE")
+
+
+def read_you_found(words):
+    """The 'YOU FOUND <item>' banner. Returns (item name, is_gizmo) or None.
+    The name is "" while the banner is still sliding in (FOUND visible, item not yet)."""
+    words = [w for w in words if w]
+    fi = next((i for i, t in enumerate(words) if is_found_word(t)), None)
+    if fi is None:
+        return None
+    has_you = any(fix_ocr(t) in YOU_WORDS or close_to(t, "YOU") or fix_ocr(t).startswith("YO")
+                  for t in words[:fi])
+    if not has_you and fix_ocr(words[fi]) not in FOUND_WORDS:
+        return None                          # neither "YOU" nor a clean FOUND: not the banner
+    sprite = gizmo = False
+    parts = []
+    for t in words[fi + 1:]:
+        u = re.sub(r"[^A-Z0-9]", "", fix_ocr(t))
+        if not u:
+            continue
+        if is_sprite_word(u) and is_gizmo_word(u[5:]):          # SPRITEGIZMO glued together
+            sprite = gizmo = True
+            parts += ["SPRITE", "GIZMO"]
+        elif is_gizmo_word(u):
+            gizmo = True
+            parts.append("GIZMO")
+        elif is_sprite_word(u):
+            sprite = True
+            parts.append("SPRITE")
+        elif len(u) > 2 and u.isalpha():
+            parts.append(u)
+    if sprite:                                  # "SPRITE GIZMO" is always a gizmo
+        gizmo = True
+        return "Sprite Gizmo", True
+    name = " ".join(dict.fromkeys(parts)).title()
+    if gizmo and "Gizmo" not in name:
+        name = (name + " Gizmo").strip()
+    return name, gizmo
+
+
 def norm_word(t):
     return re.sub(r"[^A-Z0-9-]", "", t.upper())
 
@@ -767,6 +855,7 @@ class Bot:
         self.q.put(("log", line))
 
     def status(self, headline, detail=""):
+        self.last_status = f"{headline} {detail}".strip()
         self.q.put(("status", headline, detail))
 
     def push_stats(self):
@@ -800,6 +889,10 @@ class Bot:
                           start=time.time(), paused_total=0.0, items=[])
         self._summary_sent = False
         self._stop_reason = "Stopped"
+        self.in_match = False
+        self.last_status = "Starting"
+        threading.Thread(target=self.banner_watch, daemon=True).start()
+        threading.Thread(target=self.status_watch, daemon=True).start()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         self.q.put(("state", "RUNNING"))
@@ -1145,6 +1238,7 @@ class Bot:
             self.log(f"ERROR: {e}")
             self._stop_reason = f"error: {e}"
         finally:
+            self.in_match = False
             self.release_all()
             try:
                 self.send_summary()
@@ -1225,9 +1319,10 @@ class Bot:
         """Reward pop-ups in the lobby: 'TREASURE FOUND!', 'ITEM ACQUIRED', 'PIRATE SHOP ACCESS
         UNLOCKED!' ... Presses the CLAIM / CLAIM ALL button at the bottom."""
         def look(words):
-            t = {w["t"] for w in words}
+            # fix digit misreads (UNL0CKED, C1AIM) so the checks below see real words
+            t = {fix_ocr(w["t"]) for w in words}
             # reward pop-ups put CLAIM / CLAIM ALL low and near the middle of the screen
-            btns = [w for w in words if w["t"] == "CLAIM" and w["fy"] > 0.75 and 0.3 < w["fx"] < 0.75]
+            btns = [w for w in words if close_to(w["t"], "CLAIM") and w["fy"] > 0.75 and 0.3 < w["fx"] < 0.75]
             return t, btns
 
         ws = self.scan_words() if ws is None else ws
@@ -1238,9 +1333,11 @@ class Bot:
             if btns2:
                 ws, btns = ws2, btns2
             t |= t2
-        found_word = any(x.startswith("FOUN") for x in t)
-        title = ("ACQUIRED" in t or "UNLOCKED" in t or ("TREASURE" in t and found_word)
-                 or t & {"REWARD", "REWARDS", "CONGRATULATIONS"})
+        found_word = any(is_found_word(x) for x in t)
+        near = lambda word: any(close_to(x, word) for x in t)
+        title = (near("ACQUIRED") or near("UNLOCKED") or (near("TREASURE") and found_word)
+                 or near("REWARD") or near("REWARDS") or near("CONGRATULATIONS"))
+        t |= {w for w in ("ACQUIRED", "UNLOCKED", "TREASURE", "PIRATE", "ACCESS") if near(w)}
         top = {w["t"] for w in ws if w["fy"] < 0.12}             # the lobby's tab bar is at the very top
         menu_bar = len(top & {"SHOP", "LOCKER", "PASSES", "QUESTS", "CAREER", "COMPETE", "V-BUCKS"}) >= 2
         if menu_bar or t & {"SPRITES", "VICTORY", "SPAWNED"}:
@@ -1738,6 +1835,7 @@ class Bot:
         tap("space")
         self.log("Jumped from the bus.")
         self.status("Dropping", "")
+        self.in_match = True                   # the banner watcher reads "YOU FOUND" from here on
         self.sleep(max(0, min(self.s.int("match", "landing_wait"), max_len - (time.time() - match_start))))
 
         up = self.s.int("options", "look_up")
@@ -1798,35 +1896,6 @@ class Bot:
 
             if time.time() - last_banner > 4:
                 last_banner = time.time()
-                keys = [k.strip().upper() for k in self.s.get("text", "banner_words").split(",") if k.strip()]
-
-                def you_found(words):
-                    """The 'YOU FOUND <item>' banner. Returns the item name or None."""
-                    fi = next((i for i, t_ in enumerate(words) if t_.startswith("FOUN") or t_.endswith("OUND")), None)
-                    if fi is None:
-                        return None
-                    has_you = any(t_ in ("YOU", "YOUR") or t_.startswith("YO") for t_ in words[:fi + 1])
-                    if not has_you and not (words[fi] == "FOUND" and fi + 1 < len(words)):
-                        return None                     # "YOU" misread: still need a clean FOUND <item>
-                    name = re.sub(r"[^A-Z ]", " ", " ".join(words[fi + 1:]))
-                    name = re.sub(r"(?<=[A-Z])(GIZMO)", r" \1", name)      # SPRITEGIZMO -> SPRITE GIZMO
-                    name = " ".join(x for x in name.split() if len(x) > 2).title()
-                    return name or "Item"
-
-                item = None
-                for inv in (False, True):
-                    item = you_found([w["t"] for w in self.scan_words("banner", inv)])
-                    if item:
-                        break
-                if item:
-                    if "Gizmo" in item:
-                        self.stats["gizmos"] += 1
-                    self.stats["found"] += 1
-                    self.push_stats()
-                    self.log(f"You found: {item}")
-                    self.stats.setdefault("items", []).append(item)
-                    self.discord(f"You found {item}!", self.s.bool("discord", "shot_on_find"))
-                    self.sleep(6)
                 feed = ocr_text(self.zone_img("feed")).lower()
                 if self.s.bool("main", "reboot_thanks") and \
                         any(w.strip() and w.strip() in feed
@@ -1841,20 +1910,88 @@ class Bot:
             else:
                 self.sleep(2)
 
+        self.in_match = False
         self.release_all()
         self.leave_match()
         self.stats["players"] = None
         self.push_stats()
         self.sleep(6)
 
+    # --- background watchers -------------------------------------------------
+    def read_banner(self):
+        for inv in (False, True):
+            r = read_you_found([w["t"] for w in self.scan_words("banner", inv)])
+            if r is not None:
+                return r
+        return None
+
+    def banner_watch(self):
+        """Reads the 'YOU FOUND' banner about once a second during the match, on its own
+        thread, so it's never missed while the bot is busy walking or turning."""
+        cooldown = 0.0
+        while self.running and not self.stop_flag.is_set():
+            try:
+                if self.in_match and not self.paused and time.time() > cooldown:
+                    res = self.read_banner()
+                    if res:
+                        name, giz = res
+                        tries = 0
+                        while not name and tries < 4:          # banner still sliding in
+                            time.sleep(0.5)
+                            tries += 1
+                            again = self.read_banner()
+                            if again:
+                                name, giz = again[0] or name, giz or again[1]
+                        if not name and not giz:
+                            cooldown = time.time() + 3       # "... FOUND" without an item: not the banner
+                            time.sleep(0.6)
+                            continue
+                        name = name or "Gizmo"
+                        if giz:
+                            self.stats["gizmos"] += 1
+                        self.stats["found"] += 1
+                        self.stats.setdefault("items", []).append(name)
+                        self.push_stats()
+                        self.log(f"You found: {name}" + ("  (gizmo)" if giz else ""))
+                        self.discord(f"You found {name}!", self.s.bool("discord", "shot_on_find"))
+                        cooldown = time.time() + 7            # the same banner stays up a few seconds
+            except Exception as e:
+                self.log(f"Banner check error: {e}")
+                time.sleep(3)
+            time.sleep(0.6)
+
+    def status_watch(self):
+        """Every X minutes (Settings > Discord), a screenshot of the whole monitor to Discord."""
+        last = time.time()
+        while self.running and not self.stop_flag.is_set():
+            time.sleep(1)
+            if not self.s.bool("discord", "status_shot"):
+                last = time.time()
+                continue
+            every = max(5, min(240, self.s.int("discord", "status_min"))) * 60
+            if time.time() - last < every:
+                continue
+            last = time.time()
+            try:
+                buf = io.BytesIO()
+                grab().save(buf, "PNG")              # whole monitor, not just Fortnite
+                sec = self.afk_seconds()
+                st = self.stats
+                text = (f"Status: {self.last_status}{' (paused)' if self.paused else ''}  |  "
+                        f"Time AFK {sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}  |  "
+                        f"Matches {st['matches']}  |  Gizmos {st['gizmos']}  |  Found {st['found']}")
+                if self.discord(text, png=buf.getvalue()):
+                    self.log("Status screenshot sent to Discord.")
+            except Exception as e:
+                self.log(f"Status screenshot error: {e}")
+
     # --- discord ----------------------------------------------------------
-    def discord(self, text, with_shot=False):
+    def discord(self, text, with_shot=False, png=None):
         url = self.s.get("discord", "webhook").strip()
         if not valid_webhook(url):
             self.log("Discord: the webhook URL is missing or not valid.")
             return False
-        png = None
-        if with_shot:
+        if png is None and with_shot:
             try:
                 buf = io.BytesIO()
                 self.full_shot().save(buf, "PNG")
@@ -2239,7 +2376,19 @@ class SettingsWindow(tk.Toplevel):
         Check(f, "Screenshot when an item is found (banner)", var).pack(anchor="w", padx=16, pady=(12, 4))
         var2 = tk.BooleanVar(value=self.s.bool("discord", "summary"))
         var2.trace_add("write", lambda *_: self.s.set("discord", "summary", var2.get()))
-        Check(f, "Send a session summary when the bot stops", var2).pack(anchor="w", padx=16, pady=(4, 12))
+        Check(f, "Send a session summary when the bot stops", var2).pack(anchor="w", padx=16, pady=(4, 4))
+        row = tk.Frame(f, bg=BG)
+        row.pack(anchor="w", padx=16, pady=(4, 2))
+        var3 = tk.BooleanVar(value=self.s.bool("discord", "status_shot"))
+        var3.trace_add("write", lambda *_: self.s.set("discord", "status_shot", var3.get()))
+        Check(row, "Status screenshot of your whole screen every", var3).pack(side="left")
+        mins = tk.StringVar(value=str(max(5, min(240, self.s.int("discord", "status_min")))))
+        ttk.Spinbox(row, from_=5, to=240, increment=5, width=5, textvariable=mins).pack(side="left", padx=8)
+        mins.trace_add("write", lambda *_: self.save_num("discord", "status_min", mins, 5, 240))
+        tk.Label(row, text="minutes", bg=BG, fg=FG, font=FONT).pack(side="left")
+        tk.Label(f, text="While the bot runs, a picture of your whole monitor goes to the webhook, so you can "
+                 "check from your phone that the game is open and nothing is stuck. 5-240 min.",
+                 bg=BG, fg=DIM, font=FONT_S, wraplength=S(640), justify="left").pack(anchor="w", padx=16, pady=(0, 12))
 
     def hook_changed(self):
         url = self.hook.get().strip()

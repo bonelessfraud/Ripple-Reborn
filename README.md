@@ -1,4 +1,4 @@
-# Ripple Reborn (v1.2): AFK Fortnite bot for gizmos, treasure and pirate tokens
+# Ripple Reborn (v1.3): AFK Fortnite bot for gizmos, treasure and pirate tokens
 
 `RippleReborn.exe` is on the [latest release](../../releases/latest). No Python and no installs needed: text reading uses the OCR built into Windows 10/11.
 
@@ -25,7 +25,7 @@ Queues Battle Royale on its own, drops, plays like an idle human, claims your re
 4. Press **Start** (or **Ctrl+Alt+1**). The bot window minimizes and the bot takes over.
 5. **Ctrl+Alt+2** stops it, **Ctrl+Alt+P** pauses, **Ctrl+Alt+K** kills it.
 
-Check you're on the newest build: the version shows under the title (**v1.2**) and in the first line of the session feed.
+Check you're on the newest build: the version shows under the title (**v1.3**) and in the first line of the session feed.
 
 ## The main window
 
@@ -78,6 +78,7 @@ Changes save the moment you make them, to `%APPDATA%\RippleReborn\settings.ini`.
 | Webhook URL | shows **● valid link** when it looks right; **Test webhook** sends a test message |
 | Screenshot when an item is found | attaches a screenshot to every find / claim |
 | Send a session summary when the bot stops | one message with time AFK, matches, gizmos, finds, recoveries and the items list |
+| **Status screenshot of your whole screen every X minutes** | while the bot runs, a picture of your whole monitor goes to the webhook with what the bot is doing, so you can check from your phone that the game is open and nothing is stuck. 5–240 minutes (default 30). **Off by default.** |
 
 ### Tools
 
@@ -127,6 +128,10 @@ Changes save the moment you make them, to `%APPDATA%\RippleReborn\settings.ini`.
 ## Rewards, finds and surveys
 
 - **YOU FOUND banner** (e.g. *YOU FOUND SPRITE GIZMO*): Gizmos +1 (if it's a gizmo), found +1, posted to Discord as *"You found Sprite Gizmo!"*. Nothing else in a match is posted: map names, *SPAWNED* banners, spectating screens are ignored.
+  - Checked about **once a second** on its own, so it isn't missed while the bot is walking or turning.
+  - If the banner is still **sliding in** (FOUND visible, item not yet), it waits a moment and reads again for the item name.
+  - Reads **misread text** too: *F0UND, GEMO, CIZMO, GIZM0, SPRLTE, UNL0CKED, C1AIM* … and other game languages (*HAI TROVATO, TU AS TROUVÉ, DU HAST GEFUNDEN* …).
+  - **SPRITE GIZMO is always counted as a gizmo.**
 - **Lobby rewards**: *Treasure Found*, *Item Acquired* and *Pirate Shop Access* get their **CLAIM / CLAIM ALL** pressed and posted as *"Claimed: …"*. Never on the Treasure tab or Sprites page, never on a button that says Equip.
 - **Surveys**: *"We want to hear from you!"* gets **SKIP**, never Submit or a rating.
 - **Discord blocked?** If Windows Firewall or an antivirus blocks the exe from the internet, it retries through Windows' own `curl.exe` and tells you in the feed if it still can't get through.
@@ -166,6 +171,7 @@ Every push to this repo builds the exe on GitHub (Actions → *Build RippleRebor
 
 | Version | What changed |
 | --- | --- |
+| **v1.3** | **Status screenshots**: Settings → Discord can send a picture of your whole screen every 5–240 minutes (default 30, off by default). **Gizmos recognized much better**: the YOU FOUND banner is checked about once a second on its own thread, waits for a banner that's still sliding in, understands misread and translated text (GEMO, CIZMO, F0UND, TR0VATO, UNL0CKED …), and SPRITE GIZMO always counts as a gizmo. |
 | **v1.2** | **Players left read from the real HUD counter** (the number next to the person icon, left of the minimap), at 1920×1080 and 1920×1200; old saved spots reset once. |
 | **v1.1** | **Version numbering**: the app shows its version (title, Settings, feed) and every GitHub release is named after it (v1.1, v1.2 …). |
 | **v1.0** | Everything before numbered releases (list below). |
