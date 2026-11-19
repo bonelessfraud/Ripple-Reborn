@@ -42,7 +42,7 @@ try:
 except ImportError:  # pragma: no cover
     requests = None
 
-VERSION = "1.4"     # +0.1 for every published update; the GitHub release is named after it
+VERSION = "1.5"     # +0.1 for every published update; the GitHub release is named after it
 APP = "RippleReborn"
 IS_WIN = sys.platform == "win32"
 
@@ -976,6 +976,12 @@ class Bot:
         return grab((x, y, x + w, y + h))
 
     def click_abs(self, x, y):
+        x0, y0, w, h = self.rect()
+        fx, fy = (x - x0) / w, (y - y0) / h
+        if 0.28 < fx < 0.72 and fy > 0.14 and self.in_lobby():
+            # the middle of the lobby is your character: a click there opens the Locker
+            self.log(f"Not clicking at ({int(x)}, {int(y)}): that is your character / the Locker.")
+            return
         focus(self.hwnd or find_fortnite())
         click(x, y)
 
@@ -1382,7 +1388,7 @@ class Bot:
             self.push_stats()
             self.log(f"Reward screen: {what} - claiming.")
             self.stats.setdefault("items", []).append(what)
-            self.discord(f"Claimed: {what}", self.s.bool("discord", "shot_on_find"))
+            self.discord(f"Claimed: {what}")      # text only: screenshots are for YOU FOUND
         self._last_claim = time.time()
         self.click_abs(bx, by)
         self.sleep(2.5)
@@ -1658,8 +1664,15 @@ class Bot:
         for bx1, by1, bx2, by2 in find_yellow_buttons(img):
             b = (x + bx1, y + by1, x + bx2, y + by2)
             cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            bw, bh = b[2] - b[0], b[3] - b[1]
+            fx = (cx - x) / w
             if cy - y < 0.6 * h:
                 continue  # gold treasure in the lobby background, not a button
+            # the PLAY button: big, wide, and either in the lobby's left panel or the mode panel
+            if bw < 0.11 * w or bh < 0.04 * h or not 2.5 <= bw / max(1, bh) <= 6.5:
+                continue  # gold coins / glows near your character - clicking there opens the Locker
+            if not (fx < 0.32 or 0.55 < fx < 0.88):
+                continue
             if not any(l <= cx <= r and t <= cy <= bt for l, t, r, bt in mine):
                 out.append(b)
         return out
@@ -1743,10 +1756,10 @@ class Bot:
         """Click the lobby mode button ('Zero Build, Squad, Fill') above PLAY."""
         hit, _ = self.find_text(["SQUAD", "SQUADS", "FILL", "BUILD", "SOLO", "DUO", "DUOS", "TRIO", "TRIOS"],
                                 pick="first", min_fy=0.45)
-        if hit and hit["fx"] < 0.35:
+        if hit and hit["fx"] < 0.30 and 0.5 < hit["fy"] < 0.85:
             x, y = hit["cx"], hit["cy"]
         else:
-            boxes = self.yellow_buttons()
+            boxes = [b for b in self.yellow_buttons() if (b[0] + b[2]) / 2 - self.rect()[0] < 0.32 * self.rect()[2]]
             if not boxes:
                 self.log("Mode button: not on the Play screen.")
                 return False
