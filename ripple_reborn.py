@@ -42,7 +42,7 @@ try:
 except ImportError:  # pragma: no cover
     requests = None
 
-VERSION = "1.3"     # +0.1 for every published update; the GitHub release is named after it
+VERSION = "1.4"     # +0.1 for every published update; the GitHub release is named after it
 APP = "RippleReborn"
 IS_WIN = sys.platform == "win32"
 
@@ -1322,7 +1322,9 @@ class Bot:
             # fix digit misreads (UNL0CKED, C1AIM) so the checks below see real words
             t = {fix_ocr(w["t"]) for w in words}
             # reward pop-ups put CLAIM / CLAIM ALL low and near the middle of the screen
-            btns = [w for w in words if close_to(w["t"], "CLAIM") and w["fy"] > 0.75 and 0.3 < w["fx"] < 0.75]
+            # exact CLAIM only (after fixing digit misreads): a fuzzy match also hit random HUD words
+            btns = [w for w in words if re.sub(r"[^A-Z]", "", fix_ocr(w["t"])) == "CLAIM"
+                    and w["fy"] > 0.75 and 0.3 < w["fx"] < 0.75]
             return t, btns
 
         ws = self.scan_words() if ws is None else ws
@@ -1335,13 +1337,20 @@ class Bot:
             t |= t2
         found_word = any(is_found_word(x) for x in t)
         near = lambda word: any(close_to(x, word) for x in t)
-        title = (near("ACQUIRED") or near("UNLOCKED") or (near("TREASURE") and found_word)
-                 or near("REWARD") or near("REWARDS") or near("CONGRATULATIONS"))
+        # a reward pop-up's own title, never single words like "Acquired" (the Locker's sort
+        # order says "Latest Acquired")
+        title = ((near("ITEM") and near("ACQUIRED")) or (near("TREASURE") and found_word)
+                 or (near("UNLOCKED") and (near("PIRATE") or near("ACCESS") or near("SHOP")))
+                 or near("CONGRATULATIONS"))
         t |= {w for w in ("ACQUIRED", "UNLOCKED", "TREASURE", "PIRATE", "ACCESS") if near(w)}
         top = {w["t"] for w in ws if w["fy"] < 0.12}             # the lobby's tab bar is at the very top
         menu_bar = len(top & {"SHOP", "LOCKER", "PASSES", "QUESTS", "CAREER", "COMPETE", "V-BUCKS"}) >= 2
-        if menu_bar or t & {"SPRITES", "VICTORY", "SPAWNED"}:
-            return False                       # lobby / Treasure page / match screens, not a pop-up
+        in_match = t & {"TEAMMATE", "SPECTATING", "REBOOT", "REBOOTED", "WAITING", "REMAINING",
+                        "PLAYERS", "STORM", "KNOCKED", "ELIMINATED", "HARVESTING"}
+        other_ui = t & {"SPRITES", "VICTORY", "SPAWNED", "EMOTES", "EMOTE", "SORT", "SEARCH", "EDIT",
+                        "LATEST", "LOCKER", "BACK", "OUTFIT", "OUTFITS"}
+        if menu_bar or in_match or other_ui:
+            return False                       # lobby, match / spectating HUD, Locker ...: not a pop-up
         if not btns and not title:
             return False
         if btns:
@@ -1358,11 +1367,13 @@ class Bot:
             return False
         if self.is_forbidden(bx, by, ws, rx=40, ry=12):
             return False
+        if not btns and not title:
+            return False
         if time.time() - getattr(self, "_last_claim", 0) > 10:
-            if t & {"PIRATE", "ACCESS"}:
-                what = "Pirate Shop Access"
-            elif "TREASURE" in t and found_word:
+            if near("TREASURE") and found_word:
                 what = "Treasure Found"
+            elif near("PIRATE") and near("ACCESS"):
+                what = "Pirate Shop Access"
             elif "ACQUIRED" in t:
                 what = "Item Acquired"
             else:
@@ -1431,6 +1442,10 @@ class Bot:
                 k = max((self.key(w["raw"]) for w in words), key=len)
                 if len(k) < 4 or not any(c.isalpha() for c in k):
                     continue
+                if any(k.startswith(x) for x in ("play", "space", "attack", "hold", "charge", "reboot",
+                                                 "waiting", "remaining", "survivor", "knocked", "enter",
+                                                 "free", "fall", "previous", "next", "teammate", "spectat")):
+                    continue                    # HUD / hint text, not a teammate name
                 if any(r["key"] == k[:6] for r in rows):
                     continue
                 nw = max(words, key=lambda w: len(self.key(w["raw"])))   # longest word of the name
