@@ -42,7 +42,10 @@ try:
 except ImportError:  # pragma: no cover
     requests = None
 
-VERSION = "1.5"     # +0.1 for every published update; the GitHub release is named after it
+VERSION = "1.6"
+# #feedback webhook for anonymous token / car finds. Filled in by the GitHub build from the
+# repository secret FEEDBACK_WEBHOOK; empty = feature off.
+FEEDBACK_WEBHOOK = ""     # +0.1 for every published update; the GitHub release is named after it
 APP = "RippleReborn"
 IS_WIN = sys.platform == "win32"
 
@@ -123,8 +126,10 @@ DEFAULTS = {
     "options": {
         "ocr_lobby": "1", "debug_shots": "0", "always_on_top": "1", "set_quads": "1",
         "pickaxe_key": "1", "gun_key": "2", "look_up": "150", "sprint_key": "shift",
+        "slide_key": "ctrl", "shield_key": "",
         "color": "#7c2cf0",
     },
+    "totals": {"secs": "0", "matches": "0", "gizmos": "0", "tokens": "0"},
     "discord": {"webhook": "", "shot_on_find": "1", "summary": "1", "status_shot": "0", "status_min": "30"},
     "text": {
         "afk1": "brb, afk for a minute", "afk2": "still afk, back soon",
@@ -742,41 +747,82 @@ def is_sprite_word(t):
     return t.startswith("SPRIT") or t.startswith("SPRLT") or close_to(t, "SPRITE")
 
 
+def is_token_word(t):
+    t = fix_ocr(t)
+    return close_to(t, "TOKEN") or t.startswith("TOKE") or t.endswith("OKEN")
+
+
+def is_pirate_word(t):
+    t = fix_ocr(t)
+    return close_to(t, "PIRATE") or t in ("IRATE", "PIRAT", "PIRATA")
+
+
+def is_car_word(t):
+    return fix_ocr(t) in ("CAR", "CAR!", "CARS")
+
+
+def is_find_hint(t):
+    """Any word that suggests a find banner is (half) on screen."""
+    return is_found_word(t) or is_gizmo_word(t) or is_token_word(t) or is_sprite_word(t)
+
+
+KIND_RANK = {"token": 4, "car": 3, "gizmo": 2, "item": 1}
+
+
 def read_you_found(words):
-    """The 'YOU FOUND <item>' banner. Returns (item name, is_gizmo) or None.
-    The name is "" while the banner is still sliding in (FOUND visible, item not yet)."""
-    words = [w for w in words if w]
-    fi = next((i for i, t in enumerate(words) if is_found_word(t)), None)
+    """The 'YOU FOUND <item>' banner. `words` are OCR word dicts (t, cx, cy, h) or plain strings.
+    Returns (name, kind) with kind token / car / gizmo / item, or None. The name is "" while the
+    banner is still sliding in (FOUND visible, item not yet)."""
+    ws = [w if isinstance(w, dict) else dict(t=w) for w in words]
+    ws = [w for w in ws if w.get("t")]
+    fi = next((i for i, w in enumerate(ws) if is_found_word(w["t"])), None)
     if fi is None:
         return None
-    has_you = any(fix_ocr(t) in YOU_WORDS or close_to(t, "YOU") or fix_ocr(t).startswith("YO")
-                  for t in words[:fi])
-    if not has_you and fix_ocr(words[fi]) not in FOUND_WORDS:
+    has_you = any(fix_ocr(w["t"]) in YOU_WORDS or close_to(w["t"], "YOU") or fix_ocr(w["t"]).startswith("YO")
+                  for w in ws[:fi])
+    if not has_you and fix_ocr(ws[fi]["t"]) not in FOUND_WORDS:
         return None                          # neither "YOU" nor a clean FOUND: not the banner
-    sprite = gizmo = False
-    parts = []
-    for t in words[fi + 1:]:
-        u = re.sub(r"[^A-Z0-9]", "", fix_ocr(t))
+    f = ws[fi]
+    items = ws[fi + 1:]
+    if "cy" in f:                            # only the item line(s) right under/after FOUND -
+        h = max(f.get("h", 20), 8)           # not player names or map places elsewhere
+        items = [w for w in items if f["cy"] - 0.6 * h <= w.get("cy", f["cy"]) <= f["cy"] + 3.5 * h
+                 and abs(w.get("cx", f["cx"]) - f["cx"]) < 14 * h]
+    sprite = gizmo = token = pirate = car = partial = False
+    other = []
+    for w in items:
+        u = re.sub(r"[^A-Z0-9]", "", fix_ocr(w["t"]))
         if not u:
             continue
         if is_sprite_word(u) and is_gizmo_word(u[5:]):          # SPRITEGIZMO glued together
             sprite = gizmo = True
-            parts += ["SPRITE", "GIZMO"]
+        elif is_token_word(u):
+            token = True
+        elif is_pirate_word(u):
+            pirate = True
+        elif is_car_word(u):
+            car = True
         elif is_gizmo_word(u):
             gizmo = True
-            parts.append("GIZMO")
         elif is_sprite_word(u):
             sprite = True
-            parts.append("SPRITE")
-        elif len(u) > 2 and u.isalpha():
-            parts.append(u)
+        elif any(v.startswith(u) for v in ("PIRATE", "TOKEN", "GIZMO", "SPRITE")) and len(u) >= 2:
+            partial = True                      # "PIR", "TOK": the name is still sliding in
+        elif len(u) > 2 and u.isalpha() and len(other) < 3:
+            other.append(u)
+    if token:
+        return "Pirate Token", "token"
+    if car:
+        return "Car", "car"
     if sprite:                                  # "SPRITE GIZMO" is always a gizmo
-        gizmo = True
-        return "Sprite Gizmo", True
-    name = " ".join(dict.fromkeys(parts)).title()
-    if gizmo and "Gizmo" not in name:
-        name = (name + " Gizmo").strip()
-    return name, gizmo
+        return "Sprite Gizmo", "gizmo"
+    if gizmo:
+        return (" ".join(other[:2]) + " Gizmo").strip().title(), "gizmo"
+    if pirate or partial:                       # "PIRATE" alone / "PIR": half read - look again
+        return "", "item"
+    if not any(len(o) >= 4 for o in other):     # nothing that looks like an item name yet
+        return "", "item"
+    return " ".join(other).title(), "item"
 
 
 def norm_word(t):
@@ -831,6 +877,15 @@ class Stopped(Exception):
     pass
 
 
+class Restart(Exception):
+    """Fortnite is frozen / closed / stuck: restart it and carry on."""
+    pass
+
+
+FORTNITE_EXE = "FortniteClient-Win64-Shipping.exe"
+FORTNITE_URI = "com.epicgames.launcher://apps/fn%3A4fe75bbc5a674f4f9b356b5c90567da5%3AFortnite?action=launch&silent=true"
+
+
 class Bot:
     def __init__(self, settings, ui_queue):
         self.s = settings
@@ -840,8 +895,9 @@ class Bot:
         self.stop_flag = threading.Event()
         self.thread = None
         self.hwnd = None
-        self.stats = dict(matches=0, found=0, recoveries=0, gizmos=0, players=None, start=0.0,
-                          paused_total=0.0)
+        self.stats = dict(matches=0, found=0, recoveries=0, gizmos=0, tokens=0, cars=0, players=None,
+                          start=0.0, paused_total=0.0)
+        self.need_restart = None
         self._pause_started = 0.0
 
     # --- plumbing ---------------------------------------------------------
@@ -873,6 +929,8 @@ class Bot:
     def check(self):
         if self.stop_flag.is_set():
             raise Stopped()
+        if self.need_restart:
+            raise Restart(self.need_restart)
         while self.paused:
             if self.stop_flag.is_set():
                 raise Stopped()
@@ -885,14 +943,17 @@ class Bot:
         self.stop_flag.clear()
         self.paused = False
         self.running = True
-        self.stats.update(matches=0, found=0, recoveries=0, gizmos=0, players=None,
+        self.stats.update(matches=0, found=0, recoveries=0, gizmos=0, tokens=0, cars=0, players=None,
                           start=time.time(), paused_total=0.0, items=[])
+        self.need_restart = None
+        self._totals_saved = False
         self._summary_sent = False
         self._stop_reason = "Stopped"
         self.in_match = False
         self.last_status = "Starting"
         threading.Thread(target=self.banner_watch, daemon=True).start()
         threading.Thread(target=self.status_watch, daemon=True).start()
+        threading.Thread(target=self.health_watch, daemon=True).start()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         self.q.put(("state", "RUNNING"))
@@ -902,6 +963,32 @@ class Bot:
             self._stop_reason = reason
         self.stop_flag.set()
         self.paused = False
+
+    def rates_text(self, st=None, sec=None):
+        """Matches and gizmos per hour this session, and the all-time average."""
+        st = st or self.stats
+        sec = self.afk_seconds() if sec is None else sec
+        hours = max(sec, 1) / 3600
+        tot_s = self.s.int("totals", "secs") + (0 if self._totals_saved_flag() else sec)
+        tot_m = self.s.int("totals", "matches") + (0 if self._totals_saved_flag() else st["matches"])
+        tot_g = self.s.int("totals", "gizmos") + (0 if self._totals_saved_flag() else st["gizmos"])
+        th = max(tot_s, 1) / 3600
+        return (f"Per hour: {st['matches'] / hours:.1f} matches · {st['gizmos'] / hours:.1f} gizmos  |  "
+                f"All-time: {tot_m / th:.1f} · {tot_g / th:.1f}")
+
+    def _totals_saved_flag(self):
+        return getattr(self, "_totals_saved", False)
+
+    def save_totals(self):
+        """Add this session to the all-time totals (once)."""
+        if self._totals_saved_flag() or not self.stats.get("start"):
+            return
+        sec = self.afk_seconds()
+        st = self.stats
+        for key, add in (("secs", sec), ("matches", st["matches"]), ("gizmos", st["gizmos"]),
+                         ("tokens", st.get("tokens", 0))):
+            self.s.set("totals", key, self.s.int("totals", key) + add)
+        self._totals_saved = True
 
     def send_summary(self):
         """Post a session summary to Discord (once per session)."""
@@ -918,8 +1005,9 @@ class Bot:
         items = ", ".join(f"{k} x{v}" if v > 1 else k for k, v in counts.items()) or "none"
         text = (f"**Ripple Reborn - session ended** ({getattr(self, '_stop_reason', 'Stopped')})\n"
                 f"Time AFK: {sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}\n"
-                f"Matches: {st['matches']}  |  Gizmos: {st['gizmos']}  |  Found: {st['found']}  |  "
-                f"Recoveries: {st['recoveries']}\n"
+                f"Matches: {st['matches']}  |  Gizmos: {st['gizmos']}  |  Tokens: {st.get('tokens', 0)}  |  "
+                f"Found: {st['found']}  |  Recoveries: {st['recoveries']}\n"
+                f"{self.rates_text()}\n"
                 f"Items: {items}")
         if self.discord(text):
             self.log("Session summary sent to Discord.")
@@ -1187,6 +1275,8 @@ class Bot:
         over small rocks, drifting the camera a little and now and then strafing."""
         sprint = self.s.get("options", "sprint_key").strip().lower()
         sprint = sprint if sprint in SCAN else ""
+        slide = self.s.get("options", "slide_key").strip().lower()
+        slide = slide if slide in SCAN and sprint else ""
         strafe = random.choice(["a", "d"]) if random.random() < 0.3 else None
         sprinting = bool(sprint) and random.random() < 0.8
         held = ["w"] + ([strafe] if strafe else [])
@@ -1208,6 +1298,10 @@ class Bot:
                 if sprint and random.random() < 0.035:   # slow down / speed back up
                     sprinting = not sprinting
                     key_event(sprint, sprinting)
+                if slide and sprinting and random.random() < 0.02:   # slide: sprint + crouch
+                    key_event(slide, True)
+                    time.sleep(random.uniform(0.5, 0.9))
+                    key_event(slide, False)
                 if strafe and random.random() < 0.05:    # stop strafing
                     key_event(strafe, False)
                     strafe = None
@@ -1215,13 +1309,14 @@ class Bot:
                     mouse_move_rel(random.randint(-22, 22), random.randint(-3, 3), steps=4, total_time=0.08)
                 time.sleep(0.1)
         finally:
-            for k in ["w", "a", "d"] + ([sprint] if sprint else []):
+            for k in ["w", "a", "d"] + ([sprint] if sprint else []) + ([slide] if slide else []):
                 key_event(k, False)
         self.check()
 
     def release_all(self):
         sprint = self.s.get("options", "sprint_key").strip().lower()
-        for k in {"w", "a", "s", "d", "shift", "ctrl", "space", sprint} - {""}:
+        slide = self.s.get("options", "slide_key").strip().lower()
+        for k in {"w", "a", "s", "d", "shift", "ctrl", "space", sprint, slide} - {""}:
             try:
                 key_event(k, False)
             except Exception:
@@ -1237,7 +1332,10 @@ class Bot:
             self.log(f"Fortnite found: {w}x{h}.")
             focus(self.hwnd)
             while True:
-                self.cycle()
+                try:
+                    self.cycle()
+                except Restart as e:
+                    self.restart_fortnite(str(e))
         except Stopped:
             self.log("Stopped.")
         except Exception as e:  # keep the real reason in the feed
@@ -1250,6 +1348,10 @@ class Bot:
                 self.send_summary()
             except Exception as e:
                 self.log(f"Summary error: {e}")
+            try:
+                self.save_totals()
+            except Exception:
+                pass
             self.running = False
             self.paused = False
             self.status("Stopped", "Ready. Press Start or Ctrl+Alt+1.")
@@ -1276,25 +1378,52 @@ class Bot:
         t0 = time.time()
         while True:
             self.check()
-            if self.s.bool("main", "play_again"):
+            if self.s.bool("main", "play_again") and not self.stop_flag.is_set() and not self.paused:
                 hit, _ = self.find_text(["AGAIN"])
-                if hit:
+                # never requeue when the bot is stopping (an unattended queue = AFK ban risk)
+                if hit and not self.stop_flag.is_set():
                     self.log("Results screen - Play again.")
                     self.click_abs(hit["cx"], hit["cy"])
                     self.sleep(3)
             ws = self.scan_words()
-            if self.skip_survey(ws) or self.claim_rewards(ws):
+            if self.skip_survey(ws) or self.claim_rewards(ws) or self.go_to_lobby(ws):
                 continue
             lobby = self.in_lobby()
             if lobby is None:  # OCR detection disabled: just give the game time
                 self.sleep(self.s.int("match", "lobby_settle"))
                 return
             if lobby:
+                self.stuck_count = 0
+                return
+            if time.time() - t0 > 20 and self.lobby_play_box():
+                self.log("Lobby not clear, but the PLAY button is there - trying PLAY anyway.")
                 return
             if time.time() - t0 > 90:
+                self.stuck_count = getattr(self, "stuck_count", 0) + 1
+                if self.stuck_count >= 3:
+                    self.stuck_count = 0
+                    raise Restart("stuck outside the lobby for 4+ minutes")
                 self.recover("lobby not detected after 90 seconds")
                 t0 = time.time()
             self.sleep(2)
+
+    def lobby_play_box(self):
+        x0, _, w, _ = self.rect()
+        boxes = [b for b in self.yellow_buttons() if (b[0] + b[2]) / 2 - x0 < 0.32 * w]
+        return boxes[0] if boxes else None
+
+    def go_to_lobby(self, ws=None):
+        """Fortnite's home / Discover page after a start: press GO TO LOBBY."""
+        ws = self.scan_words() if ws is None else ws
+        lob = [w for w in ws if close_to(w["t"], "LOBBY") and w["fy"] > 0.8]
+        for w in lob:
+            if any(close_to(g["t"], "GO") or fix_ocr(g["t"]) == "GO" for g in ws
+                   if abs(g["cy"] - w["cy"]) < w["h"] and 0 < w["cx"] - g["cx"] < 8 * w["h"]):
+                self.log("Fortnite home page - clicking GO TO LOBBY.")
+                self.click_abs(w["cx"], w["cy"])
+                self.sleep(4)
+                return True
+        return False
 
     SURVEY_WORDS = {"HEAR", "SURVEY", "SURVEYS", "FEEDBACK", "RATING", "SATISFIED", "DISSATISFIED", "QUESTION"}
 
@@ -1721,6 +1850,8 @@ class Bot:
     def back_to_play(self, ws=None):
         """Get back to the main Play screen (e.g. after ending up on Treasure / Sprites)."""
         ws = self.scan_words() if ws is None else ws
+        if self.go_to_lobby(ws):
+            return
         tabs = [w for w in ws if w["t"] == "PLAY" and w["fy"] < 0.12]
         if tabs:
             self.log("Not on the Play screen - clicking the PLAY tab.")
@@ -1843,6 +1974,7 @@ class Bot:
 
         # ---- bus: wait, then jump ----
         match_start = time.time()                 # max match length counts from here
+        self.in_match = True                      # banner watcher: the whole match, bus included
         max_len = self.s.int("match", "max_match_min") * 60
         self.log(f"Match loaded. Will leave by {time.strftime('%H:%M:%S', time.localtime(match_start + max_len))} "
                  f"(max {max_len // 60} min).")
@@ -1869,6 +2001,17 @@ class Bot:
         up = self.s.int("options", "look_up")
         if up > 0:
             mouse_move_rel(0, -up)
+        shield = self.s.get("options", "shield_key").strip().lower()
+        if shield in SCAN:                        # drink shields right after landing
+            self.status("Landed", "Drinking shields")
+            self.log("Drinking shields.")
+            tap(shield)
+            self.sleep(0.4)
+            mouse_button(0x0002, 0x0004, hold=0.25)
+            self.sleep(random.uniform(5.0, 7.0))
+            pick = self.s.get("options", "pickaxe_key").strip().lower()
+            if pick in SCAN:
+                tap(pick)
         landed = time.time()
         sent_first = sent_second = False
         rows = []
@@ -1947,46 +2090,167 @@ class Bot:
 
     # --- background watchers -------------------------------------------------
     def read_banner(self):
+        """One look at the banner. Returns (result or None, hint) - hint is True when something
+        banner-like was seen even if it couldn't be read yet."""
+        hint = False
         for inv in (False, True):
-            r = read_you_found([w["t"] for w in self.scan_words("banner", inv)])
+            ws = self.scan_words("banner", inv)
+            r = read_you_found(ws)
             if r is not None:
-                return r
-        return None
+                return r, True
+            hint = hint or any(is_find_hint(w["t"]) for w in ws)
+        return None, hint
+
+    def burst_read(self, first=None):
+        """Hard-to-read banner: take extra photos and keep the best reading of all of them."""
+        best = first
+        for _ in range(6):
+            time.sleep(0.25)
+            r, _h = self.read_banner()
+            if r and r[0] and (not best or not best[0] or KIND_RANK[r[1]] > KIND_RANK[best[1]]):
+                best = r
+            if best and best[0] and best[1] == "token":
+                break
+        return best
 
     def banner_watch(self):
-        """Reads the 'YOU FOUND' banner about once a second during the match, on its own
-        thread, so it's never missed while the bot is busy walking or turning."""
+        """Reads the 'YOU FOUND' banner about twice a second for the WHOLE match (bus, drop,
+        walking, spectating), on its own thread, so it's never missed between moves."""
         cooldown = 0.0
         while self.running and not self.stop_flag.is_set():
             try:
                 if self.in_match and not self.paused and time.time() > cooldown:
-                    res = self.read_banner()
-                    if res:
-                        name, giz = res
-                        tries = 0
-                        while not name and tries < 4:          # banner still sliding in
-                            time.sleep(0.5)
-                            tries += 1
-                            again = self.read_banner()
-                            if again:
-                                name, giz = again[0] or name, giz or again[1]
-                        if not name and not giz:
-                            cooldown = time.time() + 3       # "... FOUND" without an item: not the banner
-                            time.sleep(0.6)
-                            continue
-                        name = name or "Gizmo"
-                        if giz:
-                            self.stats["gizmos"] += 1
-                        self.stats["found"] += 1
-                        self.stats.setdefault("items", []).append(name)
-                        self.push_stats()
-                        self.log(f"You found: {name}" + ("  (gizmo)" if giz else ""))
-                        self.discord(f"You found {name}!", self.s.bool("discord", "shot_on_find"))
+                    res, hint = self.read_banner()
+                    if (res and not res[0]) or (not res and hint):
+                        res = self.burst_read(res)              # sliding in / hard to read
+                    if res and res[0]:
+                        self.on_find(*res)
                         cooldown = time.time() + 7            # the same banner stays up a few seconds
             except Exception as e:
                 self.log(f"Banner check error: {e}")
                 time.sleep(3)
-            time.sleep(0.6)
+            time.sleep(0.4)
+
+    def on_find(self, name, kind):
+        shot = None
+        try:
+            shot = self.full_shot()
+        except Exception:
+            pass
+        if kind == "gizmo":
+            self.stats["gizmos"] += 1
+        elif kind == "token":
+            self.stats["tokens"] = self.stats.get("tokens", 0) + 1
+        elif kind == "car":
+            self.stats["cars"] = self.stats.get("cars", 0) + 1
+        self.stats["found"] += 1
+        self.stats.setdefault("items", []).append(name)
+        self.push_stats()
+        self.log(f"You found: {name}  ({kind})")
+        png = None
+        if shot is not None and self.s.bool("discord", "shot_on_find"):
+            buf = io.BytesIO()
+            shot.save(buf, "PNG")
+            png = buf.getvalue()
+        ping = "@everyone " if kind == "token" else ""          # ping only for the token
+        self.discord(f"{ping}You found {name}!", png=png)
+        if kind in ("token", "car") and shot is not None:
+            threading.Thread(target=self.post_feedback, args=(name, shot), daemon=True).start()
+
+    def post_feedback(self, name, shot):
+        """Anonymous find report to #feedback: only the middle of the screen (the banner), no
+        player names, no HUD, no webhook or account info."""
+        if not FEEDBACK_WEBHOOK:
+            return
+        try:
+            W, H = shot.size
+            crop = shot.crop((int(W * 0.30), int(H * 0.08), int(W * 0.70), int(H * 0.42)))
+            buf = io.BytesIO()
+            crop.save(buf, "PNG")
+            self.discord(f"{name} found (Ripple Reborn v{VERSION})", png=buf.getvalue(),
+                         url=FEEDBACK_WEBHOOK, quiet=True)
+        except Exception:
+            pass
+
+    def health_watch(self):
+        """Watches for a frozen, hung or closed Fortnite and asks for a restart."""
+        gone_since = hung_since = None
+        last_img, same_since = None, None
+        while self.running and not self.stop_flag.is_set():
+            time.sleep(5)
+            if self.paused or self.need_restart or getattr(self, "restarting", False):
+                gone_since = hung_since = same_since = None
+                continue
+            try:
+                hwnd = find_fortnite()
+                now = time.time()
+                if not hwnd:
+                    gone_since = gone_since or now
+                    if now - gone_since > 60:
+                        self.need_restart = "Fortnite closed or crashed"
+                    continue
+                gone_since = None
+                if IS_WIN and user32.IsHungAppWindow(hwnd):
+                    hung_since = hung_since or now
+                    if now - hung_since > 30:
+                        self.need_restart = "Fortnite is not responding"
+                    continue
+                hung_since = None
+                x, y, w, h = client_rect(hwnd)
+                img = ImageOps.grayscale(grab((x, y, x + w, y + h))).resize((64, 36))
+                if last_img is not None:
+                    diff = sum(abs(a - b) for a, b in zip(img.tobytes(), last_img.tobytes())) / (64 * 36)
+                    if diff < 0.6:
+                        same_since = same_since or now
+                        if now - same_since > 180:
+                            self.need_restart = "Fortnite's picture has been frozen for 3 minutes"
+                    else:
+                        same_since = None
+                last_img = img
+            except Exception:
+                pass
+
+    def restart_fortnite(self, reason, wait=None):
+        """Close Fortnite, start it again and put it back in the same spot on screen."""
+        wait = wait or self.sleep
+        self.restarting = True
+        self.in_match = False
+        self.need_restart = None
+        try:
+            self.release_all()
+            self.stats["recoveries"] += 1
+            self.push_stats()
+            self.status("Restarting Fortnite", reason)
+            self.log(f"Restarting Fortnite: {reason}")
+            self.discord(f"Restarting Fortnite: {reason}")
+            rect = None
+            hwnd = find_fortnite()
+            if hwnd and IS_WIN:
+                r = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(r))
+                rect = (r.left, r.top, r.right - r.left, r.bottom - r.top)
+            if IS_WIN:
+                subprocess.run(["taskkill", "/F", "/IM", FORTNITE_EXE], capture_output=True,
+                               creationflags=0x08000000)
+            wait(12)
+            self.log("Starting Fortnite again...")
+            if IS_WIN:
+                os.startfile(FORTNITE_URI)
+            t0 = time.time()
+            while not find_fortnite():
+                if time.time() - t0 > 420:
+                    raise RuntimeError("Fortnite did not start again within 7 minutes")
+                wait(5)
+            wait(25)                                    # let it finish opening
+            hwnd = find_fortnite()
+            if rect and hwnd and IS_WIN:
+                user32.ShowWindow(hwnd, 9)
+                user32.SetWindowPos(hwnd, 0, rect[0], rect[1], rect[2], rect[3], 0x0040)
+            focus(hwnd)
+            self.log("Fortnite is back - continuing.")
+        finally:
+            self.restarting = False
+            self.need_restart = None
 
     def status_watch(self):
         """Every X minutes (Settings > Discord), a screenshot of the whole monitor to Discord."""
@@ -2007,17 +2271,19 @@ class Bot:
                 st = self.stats
                 text = (f"Status: {self.last_status}{' (paused)' if self.paused else ''}  |  "
                         f"Time AFK {sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}  |  "
-                        f"Matches {st['matches']}  |  Gizmos {st['gizmos']}  |  Found {st['found']}")
+                        f"Matches {st['matches']}  |  Gizmos {st['gizmos']}  |  Tokens {st.get('tokens', 0)}  |  "
+                        f"Found {st['found']}")
                 if self.discord(text, png=buf.getvalue()):
                     self.log("Status screenshot sent to Discord.")
             except Exception as e:
                 self.log(f"Status screenshot error: {e}")
 
     # --- discord ----------------------------------------------------------
-    def discord(self, text, with_shot=False, png=None):
-        url = self.s.get("discord", "webhook").strip()
+    def discord(self, text, with_shot=False, png=None, url=None, quiet=False):
+        url = (url or self.s.get("discord", "webhook")).strip()
         if not valid_webhook(url):
-            self.log("Discord: the webhook URL is missing or not valid.")
+            if not quiet:
+                self.log("Discord: the webhook URL is missing or not valid.")
             return False
         if png is None and with_shot:
             try:
@@ -2056,6 +2322,8 @@ class Bot:
                 err += f" | curl: {code or r.stderr.strip()[:120]}"
             except Exception as e:
                 err += f" | curl: {e}"
+        if quiet:
+            return False
         self.log(f"Discord error: {err}")
         if "Permission denied" in err or "10013" in err:
             self.log("Windows is blocking RippleReborn from the internet: allow it in Windows "
@@ -2172,6 +2440,48 @@ class Check(tk.Frame):
         round_rect(self.box, 1, 1, S(20) - 1, S(20) - 1, S(6), fill=PINK if on else OFF, outline="")
         if on:
             self.box.create_text(S(20) // 2, S(20) // 2, text="✓", fill="white", font=("Segoe UI", 10, "bold"))
+
+
+KEYSYM_NAMES = {"Control_L": "ctrl", "Control_R": "ctrl", "Shift_L": "shift", "Shift_R": "rshift",
+                "Alt_L": "alt", "Alt_R": "alt", "Caps_Lock": "caps", "space": "space", "Tab": "tab",
+                "Return": "enter"}
+
+
+class KeyBox(tk.Label):
+    """Click it, then PRESS the key (Ctrl / Shift / Alt work too). Backspace / Delete clears it."""
+
+    def __init__(self, parent, var):
+        super().__init__(parent, width=7, bg=PANEL, fg=FG, font=FONT, relief="flat", bd=0,
+                         highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT,
+                         takefocus=1, cursor="hand2", padx=4, pady=4)
+        self.var = var
+        self.bind("<Button-1>", lambda _: self.focus_set())
+        self.bind("<FocusIn>", lambda _: self.config(text="press…", fg=DIM, highlightbackground=ACCENT))
+        self.bind("<FocusOut>", lambda _: self.show())
+        self.bind("<KeyPress>", self.on_key)
+        self.show()
+
+    def show(self):
+        v = self.var.get()
+        self.config(text=v.upper() if v else "—", fg=FG if v else DIM, highlightbackground=LINE)
+
+    def on_key(self, e):
+        ks = e.keysym
+        if ks in ("BackSpace", "Delete", "Escape"):
+            name = ""
+        elif ks in KEYSYM_NAMES:
+            name = KEYSYM_NAMES[ks]
+        elif len(ks) == 1 and ks.isalnum():
+            name = ks.lower()
+        elif re.fullmatch(r"F\d{1,2}", ks):
+            name = ks.lower()
+        else:
+            return "break"
+        if name and name not in SCAN:
+            return "break"
+        self.var.set(name)
+        self.master.focus_set()                 # done: show the new key
+        return "break"
 
 
 def flat_button(parent, text, cmd, bg=OFF, fg=FG, w=None, h=32, font=FONT):
@@ -2307,17 +2617,20 @@ class SettingsWindow(tk.Toplevel):
             Check(f, text, var).grid(row=r, column=c, sticky="w", padx=16, pady=6)
         f.columnconfigure(0, weight=1)
         f.columnconfigure(1, weight=1)
-        row = tk.Frame(f, bg=BG)
-        row.grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 0))
-        for label, key in (("Pickaxe key", "pickaxe_key"), ("Gun key", "gun_key"),
-                           ("Sprint key", "sprint_key")):
-            tk.Label(row, text=label, bg=BG, fg=FG, font=FONT).pack(side="left")
+        keys = tk.Frame(f, bg=BG)
+        keys.grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 0))
+        for i, (label, key) in enumerate((("Pickaxe key", "pickaxe_key"), ("Gun key", "gun_key"),
+                                          ("Shield key", "shield_key"), ("Sprint key", "sprint_key"),
+                                          ("Slide key", "slide_key"))):
+            r_, c_ = divmod(i, 3)
+            tk.Label(keys, text=label, bg=BG, fg=FG, font=FONT).grid(row=r_, column=c_ * 2, sticky="w",
+                                                                    pady=4)
             var = tk.StringVar(value=self.s.get("options", key))
             var.trace_add("write", lambda *_, k=key, v=var: self.s.set("options", k, v.get().strip()))
-            e = dark_entry(row, var, width=5)
-            e.pack(side="left", padx=(12, 30), ipady=4)
-        tk.Label(f, text="Slot keys for the random movement (e.g. 1, 2, q, F5). Gun empty = never shoot. "
-                 "Sprint: shift, ctrl, alt, caps or a letter. Empty = walk only.",
+            KeyBox(keys, var).grid(row=r_, column=c_ * 2 + 1, sticky="w", padx=(10, 28), pady=4)
+        tk.Label(f, text="Click a box and PRESS the key (Ctrl / Shift / Alt work too); Backspace clears it. "
+                 "Gun empty = never shoots. Shield = drinks shields for 5-7 s after landing. "
+                 "Sprint + Slide = slides now and then while running.",
                  bg=BG, fg=DIM, font=FONT_S, wraplength=S(640), justify="left").grid(
             row=3, column=0, columnspan=2, sticky="w", padx=16, pady=4)
         row = tk.Frame(f, bg=BG)
@@ -2433,7 +2746,7 @@ class SettingsWindow(tk.Toplevel):
         top = tk.Frame(f, bg=BG)
         top.pack(fill="x", padx=14, pady=(10, 4))
         for text, cmd in (("Test OCR", self.app.test_ocr), ("Show zones", self.app.show_zones),
-                          ("Test leave", self.app.test_leave)):
+                          ("Test leave", self.app.test_leave), ("Test restart", self.app.test_restart)):
             flat_button(top, text, cmd).pack(side="left", expand=True, fill="x", padx=4)
         cal = tk.Frame(f, bg=BG)
         cal.pack(fill="x", padx=14, pady=10)
@@ -2574,18 +2887,22 @@ class App:
 
         stats = tk.Frame(r, bg=BG)
         stats.pack(fill="x", padx=16, pady=6)
-        for i, name in enumerate(("Time AFK", "Players left", "Gizmos")):
+        for i, name in enumerate(("Time AFK", "Players left", "Gizmos", "Tokens")):
             tk.Label(stats, text=name, bg=BG, fg="#9a94c0", font=FONT).grid(row=0, column=i, sticky="w")
         self.t_afk = tk.Label(stats, text="00:00:00", bg=BG, fg=FG, font=("Segoe UI", 19, "bold"))
         self.t_afk.grid(row=1, column=0, sticky="w", padx=(0, 28))
         self.t_players = tk.Label(stats, text="--", bg=BG, fg="#a98cff", font=("Segoe UI", 19, "bold"))
         self.t_players.grid(row=1, column=1, sticky="w", padx=(0, 28))
         self.t_gizmos = tk.Label(stats, text="0", bg=BG, fg=PINK, font=("Segoe UI", 19, "bold"))
-        self.t_gizmos.grid(row=1, column=2, sticky="w")
+        self.t_gizmos.grid(row=1, column=2, sticky="w", padx=(0, 28))
         THEMED.append(lambda: self.t_gizmos.config(fg=PINK))
+        self.t_tokens = tk.Label(stats, text="0", bg=BG, fg="#ffcc4d", font=("Segoe UI", 19, "bold"))
+        self.t_tokens.grid(row=1, column=3, sticky="w")
         self.t_counts = tk.Label(stats, text="Matches 0  ·  found 0  ·  recoveries 0", bg=BG, fg=DIM,
                                  font=FONT_S)
-        self.t_counts.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.t_counts.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.t_rates = tk.Label(stats, text="Per hour: -", bg=BG, fg=DIM, font=FONT_S)
+        self.t_rates.grid(row=3, column=0, columnspan=4, sticky="w")
         self.rule()
 
         self.vars = {}
@@ -2644,6 +2961,7 @@ class App:
                     d = m[1]
                     self.t_players.config(text="--" if d["players"] is None else str(d["players"]))
                     self.t_gizmos.config(text=str(d["gizmos"]))
+                    self.t_tokens.config(text=str(d.get("tokens", 0)))
                     self.t_counts.config(text=f"Matches {d['matches']}  ·  found {d['found']}  ·  "
                                               f"recoveries {d['recoveries']}")
                 elif kind == "call":
@@ -2652,6 +2970,10 @@ class App:
             pass
         sec = self.bot.afk_seconds()
         self.t_afk.config(text=f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}")
+        if self.bot.running and sec >= 60:
+            self._rate_tick = getattr(self, "_rate_tick", 0) + 1
+            if self._rate_tick % 8 == 0:              # every 2 s is plenty
+                self.t_rates.config(text=self.bot.rates_text())
         self.root.after(250, self.poll)
 
     def set_state(self, state):
@@ -2715,6 +3037,20 @@ class App:
     def _show_settings(self):
         if self.settings_win and self.settings_win.winfo_exists():
             self.settings_win.deiconify()
+
+    def test_restart(self):
+        from tkinter import messagebox
+        if not messagebox.askyesno("Test restart", "Close Fortnite and start it again now?\n"
+                                   "(This is what the bot does by itself when Fortnite freezes.)"):
+            return
+        if self.bot.running:
+            self.bot.need_restart = "test from Settings > Tools"
+            return
+
+        def go():
+            self.bot.restart_fortnite("test from Settings > Tools",
+                                      wait=lambda s: time.sleep(s))
+        self.run_bg(go)
 
     def test_leave(self):
         def go():

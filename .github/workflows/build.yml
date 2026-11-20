@@ -17,8 +17,11 @@ jobs:
           python-version: "3.12"
       - name: Build
         shell: pwsh
+        env:
+          FEEDBACK_WEBHOOK: ${{ secrets.FEEDBACK_WEBHOOK }}
         run: |
           pip install -r requirements.txt
+          python .github/scripts/inject_feedback.py
           python -c "import re,os; v=re.search(r'(?m)^VERSION = .([0-9.]+).', open('ripple_reborn.py', encoding='utf-8').read()).group(1); open(os.environ['GITHUB_ENV'], 'a').write('VERSION=' + v + chr(10))"
           pyinstaller --onefile --noconsole --name RippleReborn --icon logo.ico --add-data "logo.png;." --add-data "logo.ico;." --collect-all winrt.runtime --collect-all winrt.windows.media.ocr --collect-all winrt.windows.graphics.imaging --collect-all winrt.windows.storage.streams --collect-all winrt.windows.foundation --collect-all winrt.windows.globalization ripple_reborn.py
       - uses: softprops/action-gh-release@v2
